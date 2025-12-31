@@ -507,10 +507,19 @@ class EvalContext(Environment):
         if not settings.telemetry_enabled or not api_key:
             return
 
+        # Prefer evaluate tool reward over agent's default 0.0
+        # The evaluate_tool reward (set via _evaluate_reward) is authoritative for tasks
+        # that define an evaluate_tool in their scenario.
+        _eval_reward = getattr(self, "_evaluate_reward", None)
+        if _eval_reward is not None:
+            reward = _eval_reward
+        else:
+            reward = self.reward
+
         try:
             payload = EvalExitPayload(
                 **self._build_base_payload().model_dump(),
-                reward=self.reward,
+                reward=reward,
                 success=self.success,
                 error_message=error_message,
             )
@@ -588,9 +597,11 @@ class EvalContext(Environment):
         # Disconnect environment (parent class) - also runs evaluate tools
         await super().__aexit__(exc_type, exc_val, exc_tb)
 
-        # Set reward from evaluate tools if not already set
-        if self.reward is None and hasattr(self, "_evaluate_reward"):
-            self.reward = self._evaluate_reward
+        # Prefer evaluate tool reward over agent's default 0.0
+        # The evaluate_tool reward is authoritative for tasks that define an evaluate_tool
+        _eval_reward = getattr(self, "_evaluate_reward", None)
+        if _eval_reward is not None and (self.reward is None or self.reward == 0.0):
+            self.reward = _eval_reward
 
         # Reset context vars
         if self._token is not None:
