@@ -23,7 +23,7 @@ class TestConnectionConfig:
 
     def test_config_with_options(self) -> None:
         """Config with all options set."""
-        transform_fn = lambda t: t  # noqa: E731
+        transform_fn = lambda t: t
         config = ConnectionConfig(
             prefix="test",
             include=["tool1", "tool2"],
@@ -142,7 +142,7 @@ class TestConnector:
 
     @pytest.mark.asyncio
     async def test_disconnect_clears_client(self) -> None:
-        """disconnect() exits client context and clears state."""
+        """disconnect() closes client and clears state."""
         connector = Connector(
             transport={},
             config=ConnectionConfig(),
@@ -281,13 +281,13 @@ class TestConnector:
 
         mock_result = mcp_types.CallToolResult(content=[], isError=False)
         mock_client = MagicMock()
-        mock_client.call_tool_mcp = AsyncMock(return_value=mock_result)
+        mock_client.call_tool = AsyncMock(return_value=mock_result)
         connector.client = mock_client
 
         await connector.call_tool("myprefix_tool1", {"arg": "value"})
 
         # Prefix should be stripped
-        mock_client.call_tool_mcp.assert_called_once_with("tool1", {"arg": "value"})
+        mock_client.call_tool.assert_called_once_with(name="tool1", arguments={"arg": "value"})
 
     @pytest.mark.asyncio
     async def test_call_tool_raises_when_not_connected(self) -> None:
@@ -301,6 +301,37 @@ class TestConnector:
 
         with pytest.raises(RuntimeError, match="Not connected"):
             await connector.call_tool("tool1", {})
+
+    def test_copy_clones_transport_and_config(self) -> None:
+        """copy() returns isolated transport/config objects."""
+        transport = {
+            "url": "https://mcp.hud.so/jsonrpc",
+            "headers": {"Environment-Name": "browser", "Environment-Id": "env-1"},
+        }
+        connector = Connector(
+            transport=transport,
+            config=ConnectionConfig(include=["tool1"], exclude=["tool2"]),
+            name="hud",
+            connection_type=ConnectionType.REMOTE,
+        )
+
+        copied = connector.copy()
+
+        assert copied is not connector
+        assert copied._transport is not transport
+        assert copied._transport["headers"] is not transport["headers"]
+        assert copied._transport["headers"]["Environment-Name"] == "browser"
+        assert copied._transport["headers"]["Environment-Id"] != "env-1"
+        assert copied.config is not connector.config
+        assert copied.config.include == ["tool1"]
+        assert copied.config.exclude == ["tool2"]
+
+        copied._transport["headers"]["Environment-Id"] = "env-3"
+        assert copied.config.include is not None
+        copied.config.include.append("tool3")
+
+        assert transport["headers"]["Environment-Id"] == "env-1"
+        assert connector.config.include == ["tool1"]
 
     def test_repr(self) -> None:
         """__repr__ shows useful info."""

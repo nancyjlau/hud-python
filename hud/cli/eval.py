@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 from rich import box
 from rich.table import Table
 
+from hud.cli.utils.api import require_api_key
 from hud.settings import settings
 from hud.types import AgentType
 from hud.utils.env import resolve_env_vars
@@ -56,10 +57,9 @@ class AgentPreset:
 # Built-in presets for the interactive picker
 _AGENT_PRESETS: list[AgentPreset] = [
     # Native agents (use provider SDKs directly)
-    AgentPreset("Claude Sonnet 4.5", AgentType.CLAUDE, "claude-sonnet-4-5"),
-    AgentPreset("GPT-5", AgentType.OPENAI, "gpt-5"),
-    AgentPreset("Operator (OpenAI Computer Use)", AgentType.OPERATOR, "computer-use-preview"),
-    AgentPreset("Gemini 3 Pro Preview", AgentType.GEMINI, "gemini-3-pro-preview"),
+    AgentPreset("Claude Sonnet 4.6", AgentType.CLAUDE, "claude-sonnet-4-6"),
+    AgentPreset("GPT-5.4", AgentType.OPENAI, "gpt-5.4"),
+    AgentPreset("Gemini 3.1 Pro (Preview)", AgentType.GEMINI, "gemini-3-1-pro"),
     AgentPreset(
         "Gemini CUA (Gemini Computer Use)",
         AgentType.GEMINI_CUA,
@@ -78,10 +78,10 @@ _AGENT_PRESETS: list[AgentPreset] = [
         },
     ),
     AgentPreset(
-        "GLM-4.5V (Z-AI)",
+        "GLM-4.6V (Z-AI)",
         AgentType.OPENAI_COMPATIBLE,
-        "z-ai/glm-4.5v",
-        {"openai_compatible": {"base_url": settings.hud_gateway_url, "model_name": "GLM-4.5V"}},
+        "z-ai/glm-4.6v",
+        {"openai_compatible": {"base_url": settings.hud_gateway_url, "model_name": "GLM-4.6V"}},
     ),
 ]
 
@@ -95,8 +95,7 @@ _DEFAULT_CONFIG_TEMPLATE = """# HUD Eval Configuration
 # max_concurrent = 30
 # max_steps = 10
 # group_size = 1
-# byok = false  # Remote only; use encrypted env vars on the platform.
-# task_ids = ["task_1", "task_2"]
+# task_ids = ["checkout-smoke", "0"]  # slugs or 0-based indices
 # verbose = true
 # very_verbose = true
 # auto_respond = true
@@ -159,11 +158,11 @@ class EvalConfig(BaseModel):
         "verbose",
         "very_verbose",
         "group_size",
-        "byok",
         "remote",
         "auto_respond",
         "quiet",
         "gateway",
+        "taskset",
     }
     # Fields loaded from [agent] section
     _AGENT_FIELDS: ClassVar[set[str]] = {"allowed_tools", "disallowed_tools"}
@@ -180,10 +179,10 @@ class EvalConfig(BaseModel):
     very_verbose: bool = False
     auto_respond: bool | None = None  # Continue without prompting
     group_size: int = 1
-    byok: bool = False
     remote: bool = False
     quiet: bool = False  # Suppress opening browser for eval links
     gateway: bool = False  # Use HUD Gateway for LLM API calls
+    taskset: str | None = None  # Taskset name to associate job with
 
     # Base agent config (these merge with task's agent_config)
     allowed_tools: list[str] | None = None
@@ -211,27 +210,16 @@ class EvalConfig(BaseModel):
 
     def validate_api_keys(self) -> None:
         """Validate required API keys for the selected agent. Raises typer.Exit on failure."""
-        # BYOK requires remote execution (check before agent_type guard)
-        if self.byok and not self.remote:
-            hud_console.error("--byok requires --remote (BYOK only works with remote execution)")
-            raise typer.Exit(1)
-
         if self.agent_type is None:
             return
 
         if self.remote:
-            if not settings.api_key:
-                hud_console.error("HUD_API_KEY is required for remote execution")
-                hud_console.info("Set it: hud set HUD_API_KEY=your-key-here")
-                raise typer.Exit(1)
+            require_api_key("run remote evaluations")
             return
 
         # Gateway mode only requires HUD_API_KEY
         if self.gateway:
-            if not settings.api_key:
-                hud_console.error("HUD_API_KEY is required for gateway mode")
-                hud_console.info("Set it: hud set HUD_API_KEY=your-key-here")
-                raise typer.Exit(1)
+            require_api_key("use gateway mode")
             return
 
         if self.agent_type == AgentType.OPENAI_COMPATIBLE:
@@ -338,47 +326,27 @@ class EvalConfig(BaseModel):
 
         # Configure gateway mode - route LLM API calls through HUD gateway
         if self.gateway:
-            hud_api_key = settings.api_key
-            if not hud_api_key:
+            if not settings.api_key:
                 raise typer.Exit(1)  # Already validated in validate_api_keys()
 
-            if self.agent_type == AgentType.CLAUDE:
-                from anthropic import AsyncAnthropic
+            from hud.agents.gateway import build_gateway_client
 
-                kwargs["model_client"] = AsyncAnthropic(
-                    api_key=hud_api_key,
-                    base_url=settings.hud_gateway_url,
-                )
-                hud_console.info("🌐 Using HUD Gateway for Claude API")
-            elif self.agent_type in (AgentType.OPENAI, AgentType.OPERATOR):
-                from openai import AsyncOpenAI
+            # Map AgentType to provider
+            agent_to_provider = {
+                AgentType.CLAUDE: "anthropic",
+                AgentType.OPENAI: "openai",
+                AgentType.OPERATOR: "openai",
+                AgentType.GEMINI: "gemini",
+                AgentType.GEMINI_CUA: "gemini",
+                AgentType.OPENAI_COMPATIBLE: "openai",
+            }
+            provider = agent_to_provider.get(self.agent_type, "openai")
+            client = build_gateway_client(provider)
 
-                kwargs["model_client"] = AsyncOpenAI(
-                    api_key=hud_api_key,
-                    base_url=settings.hud_gateway_url,
-                )
-                hud_console.info("🌐 Using HUD Gateway for OpenAI API")
-            elif self.agent_type == AgentType.OPENAI_COMPATIBLE:
-                from openai import AsyncOpenAI
-
-                kwargs["openai_client"] = AsyncOpenAI(
-                    api_key=hud_api_key,
-                    base_url=settings.hud_gateway_url,
-                )
-                hud_console.info("🌐 Using HUD Gateway for OpenAI-compatible API")
-            elif self.agent_type in (AgentType.GEMINI, AgentType.GEMINI_CUA):
-                from google import genai
-                from google.genai.types import HttpOptions
-
-                kwargs["model_client"] = genai.Client(
-                    api_key="PLACEHOLDER",
-                    http_options=HttpOptions(
-                        api_version="v1beta",
-                        base_url=settings.hud_gateway_url,
-                        headers={"Authorization": f"Bearer {hud_api_key}"},
-                    ),
-                )
-                hud_console.info("🌐 Using HUD Gateway for Gemini API")
+            # OpenAI-compatible uses openai_client key
+            is_oai_compat = self.agent_type == AgentType.OPENAI_COMPATIBLE
+            kwargs["openai_client" if is_oai_compat else "model_client"] = client
+            hud_console.info(f"🌐 Using HUD Gateway for {provider} API")
 
         return kwargs
 
@@ -570,8 +538,6 @@ class EvalConfig(BaseModel):
             table.add_row("remote", "[bold green]True[/bold green] (submitting to platform)")
         if self.gateway:
             table.add_row("gateway", "[bold green]True[/bold green] (routing via HUD Gateway)")
-        if self.byok:
-            table.add_row("byok", "[bold green]True[/bold green] (remote only)")
 
         # Tool filters (only if set)
         if self.allowed_tools:
@@ -584,7 +550,7 @@ class EvalConfig(BaseModel):
             table.add_row("", "")
             table.add_row(f"[dim]{self.agent_type.value} config[/dim]", "")
 
-            config_cls = self.agent_type.cls.config_cls
+            config_cls = self.agent_type.config_cls
             defaults = config_cls()
             overrides = self.agent_config.get(self.agent_type.value, {})
             skip = {
@@ -632,28 +598,54 @@ class EvalConfig(BaseModel):
 
 async def _run_evaluation(cfg: EvalConfig) -> tuple[list[Any], list[Any]]:
     """Run evaluation with the given config using run_dataset()."""
-    from hud.datasets import load_tasks, run_dataset
+    from pathlib import Path
+
+    from hud.datasets import run_dataset
+    from hud.datasets.loader import _load_from_api, _load_from_file
 
     if cfg.source is None or cfg.agent_type is None:
         raise ValueError("source and agent_type must be set")
 
-    # Load tasks using unified loader (handles v4→v5 conversion automatically)
+    # Load tasks — use internal loaders to capture taskset_id from API sources
     hud_console.info(f"📊 Loading tasks from: {cfg.source}…")
-    tasks = load_tasks(cfg.source)
+    path = Path(cfg.source)
+    taskset_id: str | None = None
+    try:
+        if path.exists() and path.suffix in {".json", ".jsonl"}:
+            tasks = _load_from_file(path)
+        else:
+            tasks, taskset_id = _load_from_api(cfg.source)
+    except Exception as e:
+        hud_console.error(f"Failed to load tasks from {cfg.source}: {e}")
+        raise typer.Exit(1) from e
 
     if not tasks:
         hud_console.error(f"No tasks found in: {cfg.source}")
         raise typer.Exit(1)
 
-    # Filter by task IDs if provided
+    # TODO: --taskset with file source should sync local tasks to the platform taskset
+    # (diff, save, then run). For now it just resolves the slug and associates the job.
+    if cfg.taskset:
+        from hud.datasets.loader import resolve_taskset_id
+
+        try:
+            taskset_id = resolve_taskset_id(cfg.taskset)
+        except Exception as e:
+            hud_console.error(f"Failed to resolve taskset '{cfg.taskset}': {e}")
+            raise typer.Exit(1) from e
+
+    # Filter by task slugs (or positional indices) if provided
     if cfg.task_ids:
-        id_set = set(cfg.task_ids)
-        # Match by task.id or index
-        filtered = [t for i, t in enumerate(tasks) if t.id in id_set or str(i) in id_set]
+        selector_set = set(cfg.task_ids)
+        filtered = []
+        for i, task in enumerate(tasks):
+            task_slug = getattr(task, "slug", None)
+            if (isinstance(task_slug, str) and task_slug in selector_set) or str(i) in selector_set:
+                filtered.append(task)
         if not filtered:
-            hud_console.error(f"No tasks found matching IDs: {', '.join(cfg.task_ids)}")
+            hud_console.error(f"No tasks found matching slugs/indices: {', '.join(cfg.task_ids)}")
             raise typer.Exit(1)
-        hud_console.info(f"Filtered to {len(filtered)} task(s) by ID")
+        hud_console.info(f"Filtered to {len(filtered)} task(s) by slug/index")
         tasks = filtered
     elif not cfg.all:
         # Single task mode (no --all, --full, or --task-ids)
@@ -670,14 +662,15 @@ async def _run_evaluation(cfg: EvalConfig) -> tuple[list[Any], list[Any]]:
 
     max_steps = cfg.max_steps
 
+    import uuid
+
+    from hud.eval.manager import _get_eval_name, _send_job_enter
+
     # Remote execution - submit to HUD platform
     if cfg.remote:
         agent_kwargs = {
             k: v for k, v in agent_kwargs.items() if k not in ("api_key", "model_client")
         }
-        # Create a job ID for tracking
-        import uuid
-
         from hud.datasets.utils import submit_rollouts
 
         job_id = str(uuid.uuid4())
@@ -685,15 +678,47 @@ async def _run_evaluation(cfg: EvalConfig) -> tuple[list[Any], list[Any]]:
             f"Submitting {len(tasks)} task(s) for remote execution (job_id: {job_id})…"
         )
 
-        await submit_rollouts(
+        # Build a replayable eval config
+        eval_cfg_dict = cfg.model_dump(mode="json", exclude_none=True)
+        # Use exact key matching to avoid filtering legitimate fields like max_tokens
+        sensitive_keys = {"api_key", "api_secret", "token", "password", "secret"}
+        if isinstance(eval_cfg_dict, dict):
+            agent_cfg = eval_cfg_dict.get("agent_config")
+            if isinstance(agent_cfg, dict):
+                # Filter sensitive fields from nested agent configs
+                sanitized = {}
+                for agent_name, agent_settings in agent_cfg.items():
+                    if isinstance(agent_settings, dict):
+                        sanitized[agent_name] = {
+                            k: v
+                            for k, v in agent_settings.items()
+                            if k.lower() not in sensitive_keys
+                        }
+                    else:
+                        sanitized[agent_name] = agent_settings
+                eval_cfg_dict["agent_config"] = sanitized
+
+        await _send_job_enter(
+            job_id=job_id,
+            name=_get_eval_name(tasks=tasks, group=cfg.group_size),
+            variants=None,
+            group=cfg.group_size,
+            api_key=None,
+            taskset_id=taskset_id,
+            hud_eval_config=eval_cfg_dict,
+        )
+
+        trace_ids = await submit_rollouts(
             tasks=tasks,
             job_id=job_id,
             agent_type=cfg.agent_type,
             agent_params=agent_kwargs,
             max_steps=max_steps,
             group_size=cfg.group_size,
-            use_byok=cfg.byok,
         )
+
+        if not trace_ids:
+            raise ValueError("No tasks were accepted for execution. Check errors above.")
 
         hud_console.success(f"Tasks submitted. View at: https://hud.ai/jobs/{job_id}")
         return [], tasks
@@ -721,6 +746,7 @@ async def _run_evaluation(cfg: EvalConfig) -> tuple[list[Any], list[Any]]:
         max_concurrent=cfg.max_concurrent,
         group_size=cfg.group_size,
         quiet=cfg.quiet,
+        taskset_id=taskset_id,
     )
 
     # Show reward for single task
@@ -736,7 +762,7 @@ async def _run_evaluation(cfg: EvalConfig) -> tuple[list[Any], list[Any]]:
 
 
 def eval_command(
-    source: str | None = typer.Argument(None, help="HuggingFace dataset or task JSON file"),
+    source: str | None = typer.Argument(None, help="Taskset slug or task JSON file"),
     agent: str | None = typer.Argument(
         None,
         help="Agent: claude, openai, operator, gemini, gemini_cua, openai_compatible, integration_test",  # noqa: E501
@@ -750,6 +776,11 @@ def eval_command(
     model: str | None = typer.Option(None, "--model", "-m", help="Model name"),
     config: list[str] | None = typer.Option(  # noqa: B008
         None, "--config", "-c", help="Agent config: key=value"
+    ),
+    from_json: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--from-json",
+        help="Load full eval configuration from a JSON file (e.g. exported from a HUD job).",
     ),
     # Task-overridable settings
     allowed_tools: str | None = typer.Option(
@@ -771,15 +802,14 @@ def eval_command(
         help="Automatically prompt the agent to continue if it does not respond with a tool call",
     ),
     group_size: int | None = typer.Option(None, "--group-size", help="Runs per task"),
-    task_ids: str | None = typer.Option(None, "--task-ids", help="Comma-separated task IDs to run"),
+    task_ids: str | None = typer.Option(
+        None,
+        "--task-ids",
+        help="Comma-separated task slugs (or 0-based indices) to run",
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
     remote: bool = typer.Option(
         False, "--remote", help="Submit tasks to platform for remote execution"
-    ),
-    byok: bool = typer.Option(
-        False,
-        "--byok",
-        help="Remote only: use BYOK keys from encrypted env vars for inference",
     ),
     quiet: bool = typer.Option(
         False, "--quiet", "-q", help="Suppress opening browser for eval links"
@@ -787,21 +817,33 @@ def eval_command(
     gateway: bool = typer.Option(
         False, "--gateway", "-g", help="Route LLM API calls through HUD Gateway"
     ),
+    taskset: str | None = typer.Option(
+        None, "--taskset", "-t", help="Taskset name to associate job with"
+    ),
 ) -> None:
     """🚀 Run evaluation on datasets or individual tasks with agents.
 
     Examples:
         hud eval tasks.json claude
-        hud eval hud-evals/SheetBench-50 claude --full
+        hud eval "My Tasks" claude --full              # Load from platform taskset
+        hud eval tasks.json claude --taskset "My Tasks" # Associate file tasks with taskset
         hud eval tasks.json claude --config max_tokens=32768
-        hud eval tasks.json openai --config temperature=0.7
-        hud eval tasks.json claude --full --remote  # Remote execution
-        hud eval tasks.json claude --gateway  # Route LLM calls through HUD Gateway
+        hud eval tasks.json claude --full --remote     # Remote execution
+        hud eval tasks.json claude --gateway           # Route LLM calls through HUD Gateway
     """
     hud_console.info("🔧 Initializing evaluation...")
 
-    # Load config and merge CLI args
-    cfg = EvalConfig.load().merge_cli(
+    # Load config (TOML by default), optionally override with a JSON config, then merge CLI args
+    if from_json is not None:
+        try:
+            cfg = EvalConfig.model_validate_json(from_json.read_text(encoding="utf-8"))
+        except Exception as e:
+            hud_console.error(f"Failed to load JSON config from {from_json}: {e}")
+            raise typer.Exit(1) from None
+    else:
+        cfg = EvalConfig.load()
+
+    cfg = cfg.merge_cli(
         source=source,
         agent=agent,
         model=model,
@@ -818,9 +860,9 @@ def eval_command(
         group_size=group_size,
         config=config,
         remote=remote,
-        byok=byok,
         quiet=quiet,
         gateway=gateway,
+        taskset=taskset,
     )
 
     # Find source if not provided
@@ -862,7 +904,7 @@ def eval_command(
     # Run
     start_time = time.time()
     try:
-        results, tasks = asyncio.run(_run_evaluation(cfg))
+        results, _tasks = asyncio.run(_run_evaluation(cfg))
     except ValueError as e:
         hud_console.error(str(e))
         raise typer.Exit(1) from None
@@ -871,6 +913,6 @@ def eval_command(
     if cfg.remote:
         return
 
-    from hud.datasets import display_results
-
-    display_results(results, tasks=tasks, elapsed=elapsed, show_details=len(results) <= 50)
+    if results:
+        rate = len(results) / elapsed if elapsed > 0 else 0
+        hud_console.info(f"Completed {len(results)} evals in {elapsed:.1f}s ({rate:.1f}/s)")

@@ -86,8 +86,11 @@ def _replace_placeholders(target_dir: Path, env_name: str) -> list[str]:
     return modified_files
 
 
-def _prompt_for_preset() -> str:
-    """Ask the user to choose a preset when not provided."""
+def _prompt_for_preset() -> str | None:
+    """Ask the user to choose a preset when not provided.
+
+    Returns None if the user cancels the selection.
+    """
     try:
         choices = [
             {"name": "blank", "message": "blank"},
@@ -102,11 +105,13 @@ def _prompt_for_preset() -> str:
             "Choose a preset", choices=display_choices, default=display_choices[0]
         ).ask()
         if not selected:
-            return "blank"
+            return None  # User cancelled
         for c in choices:
             if c["message"] == selected:
                 return c["name"]
         return "blank"
+    except KeyboardInterrupt:
+        return None  # User pressed Ctrl+C
     except Exception:
         return "blank"
 
@@ -187,7 +192,14 @@ def create_environment(
     hud_console = HUDConsole()
 
     # Choose preset
-    preset_normalized = (preset or "").strip().lower() if preset else _prompt_for_preset()
+    if preset:
+        preset_normalized = preset.strip().lower()
+    else:
+        preset_result = _prompt_for_preset()
+        if preset_result is None:
+            # User cancelled the selection
+            raise typer.Exit(0)
+        preset_normalized = preset_result
 
     # If no name is provided, use the preset name as the environment name
     if name is None:
@@ -270,3 +282,35 @@ def create_environment(
     hud_console.command_example("hud dev --inspector")
     hud_console.info("\n3. Review the README in this preset for specific instructions.")
     hud_console.info("\n4. Customize as needed.")
+
+
+def init_command(
+    name: str = typer.Argument(None, help="Environment name (default: directory name)"),
+    directory: str = typer.Option(".", "--dir", "-d", help="Target directory"),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing files"),
+    preset: str | None = typer.Option(
+        None,
+        "--preset",
+        "-p",
+        help="Download a preset: blank, deep-research, browser, rubrics",
+    ),
+) -> None:
+    """🚀 Initialize a HUD environment.
+
+    [not dim]• Empty directory: Choose a preset interactively
+    • Existing project: Add Dockerfile.hud and hud.py
+
+    Use --preset to skip selection and download a specific template.
+
+    Examples:
+        hud init                    # Auto-detect mode
+        hud init my-env             # Initialize with custom name
+        hud init --preset browser   # Download browser preset[/not dim]
+
+    """
+    if preset:
+        create_environment(name, directory, force, preset)
+    else:
+        from hud.cli.flows.init import smart_init
+
+        smart_init(name, directory, force)

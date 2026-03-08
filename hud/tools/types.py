@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 from mcp.types import ContentBlock, ImageContent, TextContent
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Coordinate(BaseModel):
@@ -18,16 +19,100 @@ class Coordinate(BaseModel):
     y: int = Field(..., description="Y coordinate")
 
 
-class EvaluationResult(BaseModel):
-    """Standard evaluation result format."""
+class SubScore(BaseModel):
+    """Individual subscore for debugging and transparency.
 
-    reward: float = Field(default=0.0, description="Usually a value between 0.0 and 1.0")
-    done: bool = Field(default=False, description="Whether the task/episode is complete")
-    content: str | None = Field(default=None, description="Additional information")
-    info: dict[str, Any] = Field(default_factory=dict, description="Additional information")
-    isError: bool = Field(default=False, description="Whether the evaluation failed")
+    SubScores allow breaking down the final reward into component parts,
+    making it easier to understand what contributed to the evaluation.
+
+    Example:
+        subscores=[
+            SubScore(name="correctness", weight=0.6, value=1.0),
+            SubScore(name="efficiency", weight=0.3, value=0.8),
+            SubScore(name="style", weight=0.1, value=0.5),
+        ]
+        # Final reward could be: 0.6*1.0 + 0.3*0.8 + 0.1*0.5 = 0.89
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="Name of this subscore component")
+    weight: float = Field(
+        default=1.0,
+        description="Weight of this subscore (for weighted average). "
+        "Negative weights represent penalties.",
+    )
+    value: float = Field(..., ge=0.0, le=1.0, description="Value of this subscore, 0.0 to 1.0")
+    metadata: dict[str, Any] | None = Field(default=None, exclude=True)
+
+    @property
+    def score(self) -> float:
+        """Alias for value. Deprecated — use .value instead."""
+        return self.value
+
+
+class EvaluationResult(BaseModel):
+    """Standard evaluation result format.
+
+    Used as the second yield in scenarios to provide detailed evaluation results.
+    Can include subscores for debugging and transparency.
+
+    Example:
+        yield EvaluationResult(
+            reward=0.85,
+            done=True,
+            content="Found 17 of 20 items",
+            subscores=[
+                SubScore(name="detection", weight=0.7, value=0.85),
+                SubScore(name="accuracy", weight=0.3, value=1.0),
+            ],
+        )
+    """
+
+    reward: float = Field(default=0.0, description="Final score, usually 0.0 to 1.0")
+    done: bool = Field(default=True, description="Whether the task/episode is complete")
+    content: str | None = Field(default=None, description="Human-readable explanation")
+    info: dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+    isError: bool = Field(default=False, description="Whether the evaluation itself failed")
+    subscores: list[SubScore] | None = Field(
+        default=None,
+        description="Optional breakdown of score components for debugging",
+    )
 
     model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def _check_subscores(self) -> EvaluationResult:
+        if not self.subscores:
+            return self
+        names = [s.name for s in self.subscores]
+        dupes = [n for n in names if names.count(n) > 1]
+        if dupes:
+            warnings.warn(f"Duplicate subscore names: {set(dupes)}", stacklevel=2)
+        pos_weight_sum = sum(s.weight for s in self.subscores if s.weight > 0)
+        if abs(pos_weight_sum - 1.0) > 0.01:
+            warnings.warn(
+                f"Positive subscore weights should sum to ~1.0 (got {pos_weight_sum:.4f}). "
+                f"Weights represent proportional contributions to the reward.",
+                stacklevel=2,
+            )
+        weighted_sum = sum(s.value * s.weight for s in self.subscores)
+        if abs(weighted_sum - self.reward) > 0.01:
+            warnings.warn(
+                f"Subscores don't match reward: "
+                f"sum(value*weight)={weighted_sum:.4f} but reward={self.reward:.4f}",
+                stacklevel=2,
+            )
+        return self
+
+    @classmethod
+    def from_float(cls, value: float) -> EvaluationResult:
+        """Create an EvaluationResult from a simple float reward.
+
+        Convenience method for backward compatibility with float yields.
+        Sets done=True since a float yield typically indicates completion.
+        """
+        return cls(reward=value, done=True)
 
 
 class ContentResult(BaseModel):
@@ -60,30 +145,37 @@ class ContentResult(BaseModel):
             url=combine_fields(self.url, other.url, False),
         )
 
-    def to_content_blocks(self) -> list[ContentBlock]:
-        """Helper method to convert ContentResult to content blocks.
+    def to_text_blocks(self) -> list[TextContent]:
+        """Convert text-only content to TextContent blocks.
 
-        Subclasses can use this when they work with ContentResult internally.
-
-        Args:
-            result: ContentResult to convert
+        Use this for tools that only return text output.
 
         Returns:
-            List of ContentBlock with URL embedded as metadata if available
+            List of TextContent blocks
         """
-        blocks: list[ContentBlock] = []
+        blocks: list[TextContent] = []
 
         if self.output:
             blocks.append(TextContent(text=self.output, type="text"))
         if self.error:
             blocks.append(TextContent(text=self.error, type="text"))
-        if self.base64_image:
-            blocks.append(ImageContent(data=self.base64_image, mimeType="image/png", type="image"))
-
-        # Add URL as a special metadata text block (for Gemini Computer Use)
-        # Always include URL if set, even if it's a placeholder like "about:blank"
         if self.url:
             blocks.append(TextContent(text=f"__URL__:{self.url}", type="text"))
+
+        return blocks
+
+    def to_content_blocks(self) -> list[ContentBlock]:
+        """Convert to content blocks including images.
+
+        Use to_text_blocks() for text-only tools for better type safety.
+
+        Returns:
+            List of ContentBlock with URL embedded as metadata if available
+        """
+        blocks: list[ContentBlock] = list(self.to_text_blocks())
+
+        if self.base64_image:
+            blocks.append(ImageContent(data=self.base64_image, mimeType="image/png", type="image"))
 
         return blocks
 

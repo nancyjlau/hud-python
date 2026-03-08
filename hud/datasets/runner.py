@@ -29,6 +29,8 @@ async def run_dataset(
     max_concurrent: int = 30,
     group_size: int = 1,
     quiet: bool = True,
+    job_id: str | None = None,
+    taskset_id: str | None = None,
 ) -> list[EvalContext]:
     """Run an agent on a dataset of tasks.
 
@@ -40,12 +42,16 @@ async def run_dataset(
             - A source string (file path, API slug) - loaded via load_tasks()
             - A single TaskInput (Task, LegacyTask, or dict)
             - A list of TaskInput objects
-        agent_type: Type of agent to create (e.g., "claude", "openai", AgentType.CLAUDE).
+        agent_type: Agent type (e.g., "claude", "openai", AgentType.CLAUDE).
         agent_params: Parameters to pass to agent.create().
         max_steps: Maximum steps per task.
         max_concurrent: Maximum concurrent tasks (for parallel execution).
         group_size: Number of times to run each task (for variance estimation).
         quiet: Whether to suppress printing eval links and opening browser (default True).
+        job_id: Pre-registered job ID. If provided, traces are grouped under this job
+            and no implicit job is created. If None, a job is created automatically
+            for parallel execution.
+        taskset_id: Taskset UUID to associate the job with on the platform.
 
     Returns:
         List of EvalContext results from each task execution. Access `.reward` on each.
@@ -70,6 +76,10 @@ async def run_dataset(
     from hud.datasets.loader import load_tasks
     from hud.eval.task import Task
 
+    # Normalize agent_type to AgentType enum
+    if isinstance(agent_type, str):
+        agent_type = AgentType(agent_type)
+
     # Normalize tasks to list[Task]
     task_list: list[Task]
     if isinstance(tasks, str):
@@ -86,19 +96,22 @@ async def run_dataset(
     if not task_list:
         raise ValueError("No tasks to run")
 
-    # Resolve agent class
-    agent_type_enum = agent_type if isinstance(agent_type, AgentType) else AgentType(agent_type)
-    agent_cls = agent_type_enum.cls
-
     # Use hud.eval() for both single and parallel execution
     async with hud.eval(
         task_list,
         group=group_size,
         max_concurrent=max_concurrent,
         quiet=quiet,
+        job_id=job_id,
+        taskset_id=taskset_id,
     ) as ctx:
-        # Create agent fresh for each context (ensures correct tool initialization)
-        agent = agent_cls.create(**(agent_params or {}))
+        # Build agent params - use system_prompt from ctx (set from task.agent_config)
+        final_agent_params = dict(agent_params or {})
+        if ctx.system_prompt and "system_prompt" not in final_agent_params:
+            final_agent_params["system_prompt"] = ctx.system_prompt
+
+        # Create agent using AgentType.cls.create()
+        agent = agent_type.cls.create(**final_agent_params)
         await agent.run(ctx, max_steps=max_steps)
         # Reward is computed by EvalContext.__aexit__ from evaluate tools
 
@@ -180,7 +193,7 @@ async def run_single_task(
         ```
     """
     # Determine trace name
-    effective_trace_name = trace_name or task_id or task.id or "single_task"
+    effective_trace_name = trace_name or task_id or task.slug or "single_task"
 
     # Run with explicit eval context parameters
     async with hud.eval(
@@ -198,9 +211,8 @@ async def run_single_task(
         if ctx.system_prompt and "system_prompt" not in final_agent_params:
             final_agent_params["system_prompt"] = ctx.system_prompt
 
-        # Create agent inside ctx so it has access to context-derived values
-        agent_cls = agent_type.cls
-        agent = agent_cls.create(**final_agent_params)
+        # Create agent using AgentType.cls.create()
+        agent = agent_type.cls.create(**final_agent_params)
 
         # Store metadata if provided
         if metadata:
@@ -209,5 +221,7 @@ async def run_single_task(
         result = await agent.run(ctx, max_steps=max_steps)
         # Reward is computed by EvalContext.__aexit__ from evaluate tools
 
-    # Return the Trace (ctx.reward is set by EvalContext.__aexit__)
+    # Propagate reward from EvalContext (set in __aexit__) to returned Trace
+    if ctx.reward is not None:
+        result.reward = ctx.reward
     return result

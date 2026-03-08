@@ -3,7 +3,6 @@
 Unified interface for loading evaluation tasks from:
 - HUD API (v5 format)
 - Local JSON/JSONL files (v4 LegacyTask format, auto-converted)
-- HuggingFace datasets (v4 LegacyTask format, auto-converted)
 """
 
 from __future__ import annotations
@@ -14,12 +13,16 @@ import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
+import httpx
+
+from hud.settings import settings
+
 if TYPE_CHECKING:
     from hud.eval.task import Task
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["load_dataset", "load_tasks", "save_tasks"]
+__all__ = ["load_dataset", "load_tasks", "resolve_taskset_id", "save_tasks"]
 
 
 def _load_raw_from_file(path: Path) -> list[dict[str, Any]]:
@@ -63,50 +66,36 @@ def _load_from_file(path: Path) -> list[Task]:
     from hud.eval.task import Task
 
     raw_items = _load_raw_from_file(path)
-    return [Task(**item) for item in raw_items]
+    # Default args to {} for runnable tasks (None = template)
+    return [Task(**{**item, "args": item.get("args") or {}}) for item in raw_items]
 
 
-def _load_raw_from_huggingface(dataset_name: str) -> list[dict[str, Any]]:
-    """Load raw task dicts from HuggingFace dataset."""
-    try:
-        from datasets import load_dataset as hf_load_dataset
-    except ImportError as e:
-        raise ImportError(
-            "Please install 'datasets' to load from HuggingFace: uv pip install datasets"
-        ) from e
+def resolve_taskset_id(slug: str) -> str:
+    """Resolve a taskset slug/name to its UUID via the HUD API."""
+    headers = {}
+    if settings.api_key:
+        headers["Authorization"] = f"Bearer {settings.api_key}"
 
-    # Parse dataset name and optional split
-    if ":" in dataset_name:
-        name, split = dataset_name.split(":", 1)
-    else:
-        name = dataset_name
-        split = "train"  # Default split
+    with httpx.Client() as client:
+        response = client.get(
+            f"{settings.hud_api_url}/tasks/evalset/{slug}",
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    logger.info("Loading from HuggingFace dataset: %s (split=%s)", name, split)
-    dataset = hf_load_dataset(name, split=split)
-
-    raw_items: list[dict[str, Any]] = []
-    for item in dataset:
-        if not isinstance(item, dict):
-            raise ValueError(f"Invalid HuggingFace dataset: expected dict, got {type(item)}")
-        raw_items.append(dict(item))
-
-    return raw_items
+    evalset_id = data.get("evalset_id")
+    if not evalset_id:
+        raise ValueError(f"Could not resolve taskset '{slug}' — not found or no access")
+    return evalset_id
 
 
-def _load_from_huggingface(dataset_name: str) -> list[Task]:
-    """Load tasks from HuggingFace dataset."""
-    raw_items = _load_raw_from_huggingface(dataset_name)
-    from hud.eval.task import Task
+def _load_raw_from_api(dataset_name: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Load raw task dicts from HUD API.
 
-    return [Task(**item) for item in raw_items]
-
-
-def _load_raw_from_api(dataset_name: str) -> list[dict[str, Any]]:
-    """Load raw task dicts from HUD API."""
-    import httpx
-
-    from hud.settings import settings
+    Returns (tasks, taskset_id) tuple.
+    """
+    from hud.datasets.utils import _normalize_task_dict
 
     headers = {}
     if settings.api_key:
@@ -121,24 +110,27 @@ def _load_raw_from_api(dataset_name: str) -> list[dict[str, Any]]:
         response.raise_for_status()
         data = response.json()
 
-        # Extract tasks dict from response
+        taskset_id = data.get("evalset_id")
         tasks_dict = data.get("tasks", {})
 
-        raw_items: list[dict[str, Any]] = []
-        for task_id, task_data in tasks_dict.items():
-            if task_data.get("id") is None:
-                task_data["id"] = task_id
-            raw_items.append(task_data)
+        tasks = [
+            _normalize_task_dict(task_data)
+            for task_data in tasks_dict.values()
+            if isinstance(task_data, dict)
+        ]
+        return tasks, taskset_id
 
-        return raw_items
 
+def _load_from_api(dataset_name: str) -> tuple[list[Task], str | None]:
+    """Load tasks from HUD API.
 
-def _load_from_api(dataset_name: str) -> list[Task]:
-    """Load tasks from HUD API."""
+    Returns (tasks, taskset_id) tuple.
+    """
     from hud.eval.task import Task
 
-    raw_items = _load_raw_from_api(dataset_name)
-    return [Task(**item) for item in raw_items]
+    raw_items, taskset_id = _load_raw_from_api(dataset_name)
+    tasks = [Task(**{**item, "args": item.get("args") or {}}) for item in raw_items]
+    return tasks, taskset_id
 
 
 @overload
@@ -155,7 +147,6 @@ def load_tasks(source: str, *, raw: bool = False) -> list[Task] | list[dict[str,
     Supports multiple sources with auto-detection:
     - Local file path (JSON or JSONL)
     - HUD API dataset slug (e.g., "hud-evals/SheetBench-50")
-    - HuggingFace dataset (e.g., "username/dataset" or "username/dataset:split")
 
     Automatically detects and converts v4 LegacyTask format to v5 Task.
 
@@ -163,7 +154,6 @@ def load_tasks(source: str, *, raw: bool = False) -> list[Task] | list[dict[str,
         source: Task source. Can be:
             - Path to a local JSON/JSONL file
             - HUD API dataset slug (e.g., "hud-evals/SheetBench-50")
-            - HuggingFace dataset name (e.g., "hud-evals/tasks" or "hud-evals/tasks:train")
         raw: If True, return raw dicts without validation or env var substitution.
             Useful for preserving template strings like "${HUD_API_KEY}".
 
@@ -171,30 +161,10 @@ def load_tasks(source: str, *, raw: bool = False) -> list[Task] | list[dict[str,
         - If raw=False (default): list[Task] ready to use with hud.eval()
         - If raw=True: list[dict] with raw task data
 
-    Example:
-        ```python
-        import hud
-        from hud.datasets import load_tasks
-
-        # Load from HUD API
-        tasks = load_tasks("hud-evals/SheetBench-50")
-
-        # Load from local file (v4 format auto-converted)
-        tasks = load_tasks("./my-tasks.json")
-
-        # Load from HuggingFace
-        tasks = load_tasks("hud-evals/benchmark:test")
-
-        # Load raw dicts (preserves env var placeholders)
-        raw_tasks = load_tasks("./tasks.json", raw=True)
-
-        # Run evaluation
-        async with hud.eval(tasks) as ctx:
-            await agent.run(ctx)
-        ```
-
     Raises:
-        ValueError: If task loading fails
+        httpx.HTTPStatusError: If API returns an error (e.g., 404 for unknown taskset).
+        httpx.ConnectError: If API is unreachable.
+        ValueError: If file format is invalid.
     """
     # Check if it's a local file
     path = Path(source)
@@ -204,28 +174,14 @@ def load_tasks(source: str, *, raw: bool = False) -> list[Task] | list[dict[str,
         logger.info("Loaded %d tasks from %s", len(items), source)
         return items
 
-    # Try HUD API first
-    try:
-        logger.info("Trying HUD API: %s", source)
-        items = _load_raw_from_api(source) if raw else _load_from_api(source)
-        logger.info("Loaded %d tasks from HUD API: %s", len(items), source)
-        return items
-    except Exception as hud_error:
-        logger.debug("HUD API load failed (%s), trying HuggingFace", hud_error)
-
-    # Try HuggingFace as fallback
-    try:
-        logger.info("Trying HuggingFace dataset: %s", source)
-        items = _load_raw_from_huggingface(source) if raw else _load_from_huggingface(source)
-        logger.info("Loaded %d tasks from HuggingFace: %s", len(items), source)
-        return items
-    except ImportError:
-        raise ValueError(
-            f"Failed to load tasks from '{source}'. "
-            "Install 'datasets' package for HuggingFace support."
-        ) from None
-    except Exception as hf_error:
-        raise ValueError(f"Failed to load tasks from '{source}': {hf_error}") from hf_error
+    # Try HUD API
+    logger.info("Trying HUD API: %s", source)
+    if raw:
+        items, _ = _load_raw_from_api(source)
+    else:
+        items, _ = _load_from_api(source)
+    logger.info("Loaded %d tasks from HUD API: %s", len(items), source)
+    return items
 
 
 def save_tasks(
@@ -234,15 +190,15 @@ def save_tasks(
 ) -> str:
     """Save tasks to the HUD API.
 
-    Creates or updates an evalset with the given tasks.
+    Creates or updates a taskset with the given tasks.
 
     Args:
-        name: Evalset name/slug (e.g., "my-evals/benchmark-v1").
+        name: Taskset name/slug (e.g., "my-evals/benchmark-v1").
             If no org prefix, uses user's default org.
         tasks: List of Task objects (v5 format) to save.
 
     Returns:
-        The evalset ID of the created/updated evalset.
+        The taskset ID of the created/updated taskset.
 
     Example:
         ```python
@@ -258,7 +214,7 @@ def save_tasks(
         ]
 
         # Save to HUD API
-        evalset_id = save_tasks("my-evals/benchmark-v1", tasks)
+        taskset_id = save_tasks("my-evals/benchmark-v1", tasks)
 
         # Later, load them back
         loaded = load_tasks("my-evals/benchmark-v1")
@@ -268,10 +224,6 @@ def save_tasks(
         TypeError: If any task is not a v5 Task object (must have 'scenario')
         ValueError: If API key is not set or save fails
     """
-    import httpx
-
-    from hud.settings import settings
-
     if not settings.api_key:
         raise ValueError("HUD_API_KEY is required to save tasks")
 
@@ -283,8 +235,13 @@ def save_tasks(
                 "Use Task.from_v4(legacy_task) to convert from LegacyTask."
             )
 
-    # Convert tasks to dicts (Task is a Pydantic model)
-    task_dicts = [task.model_dump(mode="json", exclude_none=True) for task in tasks]
+    # Convert tasks to dicts (Task is a Pydantic model).
+    # id is internal/platform-assigned; uploads should identify via slug.
+    task_dicts: list[dict[str, Any]] = []
+    for task in tasks:
+        task_data = task.model_dump(mode="json", exclude_none=True)
+        task_data.pop("id", None)
+        task_dicts.append(task_data)
 
     # Build request payload
     payload: dict[str, Any] = {
@@ -297,15 +254,15 @@ def save_tasks(
     try:
         with httpx.Client(timeout=60) as client:
             response = client.post(
-                f"{settings.hud_api_url}/tasks/evalset",
+                f"{settings.hud_api_url}/tasks/upload",
                 json=payload,
                 headers=headers,
             )
             response.raise_for_status()
             data = response.json()
-            evalset_id = data.get("evalset_id") or data.get("id") or name
-            logger.info("Saved %d tasks to evalset: %s", len(tasks), evalset_id)
-            return evalset_id
+            taskset_id = data.get("evalset_id") or data.get("id") or name
+            logger.info("Saved %d tasks to taskset: %s", len(tasks), taskset_id)
+            return taskset_id
     except httpx.HTTPStatusError as e:
         raise ValueError(f"Failed to save tasks: {e.response.text}") from e
     except Exception as e:

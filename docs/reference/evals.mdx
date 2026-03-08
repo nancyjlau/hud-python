@@ -26,6 +26,7 @@ async with hud.eval() as ctx:
 | `group` | `int` | Runs per variant for statistical significance | `1` |
 | `group_ids` | `list[str] \| None` | Custom group IDs for parallel runs | `None` |
 | `job_id` | `str \| None` | Job ID to link traces to | `None` |
+| `taskset_id` | `str \| None` | Platform taskset UUID to associate the job with | `None` |
 | `api_key` | `str \| None` | API key for backend calls | `None` |
 | `max_concurrent` | `int \| None` | Maximum concurrent evaluations | `None` |
 | `trace` | `bool` | Send telemetry to backend | `True` |
@@ -39,7 +40,7 @@ The `source` parameter accepts:
 # 1. Direct environment entry (recommended)
 env = Environment("my-env")
 async with env("checkout", product="laptop") as ctx:
-    await agent.run(ctx.prompt)
+    await agent.run(ctx)
 
 # 2. Blank eval - manual setup and reward
 async with hud.eval() as ctx:
@@ -192,7 +193,7 @@ for result in ctx.results:
 ## See Also
 
 - [Environments](/reference/environments) - Environment class reference
-- [A/B Evals](/quick-links/ab-testing) - Variants and groups guide
+- [Testing Environments](/advanced/testing-environments) - Variants, groups, and mock mode
 - [Deploy](/quick-links/deploy) - Running evals at scale
 - [`hud eval` CLI](/reference/cli/eval) - Command-line interface
 

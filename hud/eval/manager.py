@@ -30,40 +30,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_eval_name(tasks: list[Task] | None = None) -> str:
-    """Extract a nice name for job display.
+def _get_eval_name(tasks: list[Task] | None = None, group: int = 1) -> str:
+    """Build a job display name.
 
-    Args:
-        tasks: List of Task objects
-
-    Returns:
-        Name like "scenario with val1, val2" or "eval" if no tasks
+    Convention:
+        1 task, group=1:  "Task Run: {scenario}"
+        1 task, group>1:  "Task Run: {scenario} (4 times)"
+        N tasks, group=1: "Batch Run: N tasks"
+        N tasks, group>1: "Batch Run: N tasks (4 times)"
     """
-    from hud.eval.task import build_eval_name
+    suffix = f" ({group} times)" if group > 1 else ""
 
-    # If we have Task objects, derive name from first one
-    if tasks:
-        if tasks[0].scenario:
-            return build_eval_name(tasks[0].scenario, tasks[0].args)
-        # Fall back to env name or prompt
-        if tasks[0].env and hasattr(tasks[0].env, "name"):
-            return tasks[0].env.name
-        if tasks[0].env and hasattr(tasks[0].env, "prompt") and tasks[0].env.prompt:
-            return tasks[0].env.prompt[:30].strip()
-        if tasks[0].id:
-            return tasks[0].id
+    if not tasks:
+        return f"Task Run: eval{suffix}"
 
-    return "eval"
+    if len(tasks) == 1:
+        name = tasks[0].scenario
+        if not name and tasks[0].env and hasattr(tasks[0].env, "name"):
+            name = tasks[0].env.name
+        return f"Task Run: {name or 'eval'}{suffix}"
+
+    return f"Batch Run: {len(tasks)} tasks{suffix}"
 
 
-def _send_job_enter(
+async def _send_job_enter(
     job_id: str,
     name: str,
     variants: dict[str, Any] | None,
     group: int,
     api_key: str | None,
+    taskset_id: str | None = None,
+    hud_eval_config: dict[str, Any] | None = None,
 ) -> None:
-    """Send job enter payload (sync request before traces start)."""
+    """Send job enter payload (async request before traces start).
+
+    Registers the job with the platform.
+    """
     import httpx
 
     from hud.eval.types import JobEnterPayload
@@ -77,17 +79,18 @@ def _send_job_enter(
         name=name,
         variants=variants,
         group=group,
+        taskset_id=taskset_id,
+        hud_eval_config=hud_eval_config,
     )
 
-    try:
-        httpx.post(
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
             f"{settings.hud_api_url}/trace/job/{job_id}/enter",
             json=payload.model_dump(exclude_none=True),
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10.0,
         )
-    except Exception as e:
-        logger.warning("Failed to send job enter: %s", e)
+
+    resp.raise_for_status()
 
 
 @asynccontextmanager
@@ -103,6 +106,7 @@ async def run_eval(
     trace_id: str | None = None,
     api_key: str | None = None,
     max_concurrent: int | None = None,
+    taskset_id: str | None = None,
     trace: bool = True,
     quiet: bool = False,
 ) -> AsyncGenerator[EvalContext, None]:
@@ -122,11 +126,12 @@ async def run_eval(
         variants: A/B test configuration (dict with list values expanded)
         group: Runs per variant for statistical significance
         group_ids: Optional list of group IDs
-        job_id: Job ID to link to
+        job_id: Pre-registered job ID. Skips implicit job creation if provided.
         group_id: Group ID for parallel evaluations
         trace_id: Pre-assigned trace ID (auto-generated if not provided)
         api_key: API key for backend calls
         max_concurrent: Maximum concurrent evals (None = unlimited)
+        taskset_id: Taskset UUID to associate the job with on the platform.
         trace: Whether to send trace data to backend (default True)
         quiet: Whether to suppress printing links (default False)
 
@@ -233,9 +238,21 @@ async def run_eval(
     # Lazy import to avoid circular dependency
     from hud.eval.context import EvalContext
 
+    # Register job if not already provided by caller
+    eval_name = _get_eval_name(tasks=tasks, group=group)
+    if not job_id and (taskset_id or total_evals > 1):
+        job_id = str(uuid.uuid4())
+        await _send_job_enter(
+            job_id=job_id,
+            name=eval_name,
+            variants=variants,
+            group=group,
+            api_key=api_key,
+            taskset_id=taskset_id,
+        )
+
     if total_evals == 1:
         if tasks:
-            # Single task - use EvalContext.from_task()
             ctx = EvalContext.from_task(
                 tasks[0],
                 name=name,
@@ -251,7 +268,6 @@ async def run_eval(
             async with ctx:
                 yield ctx
         else:
-            # Blank eval - use EvalContext directly
             ctx = EvalContext(
                 name=name or "eval",
                 trace_id=trace_id,
@@ -267,33 +283,19 @@ async def run_eval(
                 yield ctx
 
     else:
-        # Parallel execution: create implicit job to group traces
-        eval_name = _get_eval_name(tasks=tasks)
-        implicit_job_id = job_id or str(uuid.uuid4())
-        job_url = f"https://hud.ai/jobs/{implicit_job_id}"
+        job_url = f"https://hud.ai/jobs/{job_id}"
 
-        # Send job enter (sync request before traces start)
-        _send_job_enter(
-            job_id=implicit_job_id,
-            name=eval_name,
-            variants=variants,
-            group=group,
-            api_key=api_key,
-        )
-
-        # Print job URL (not individual trace URLs)
         if not quiet:
             print_link(job_url, f"🚀 {eval_name}")
 
         error_occurred = False
         try:
-            # Run parallel evals with job_id
             completed = await _run_parallel_eval(
                 tasks=tasks,
                 variant_combos=variant_combos,
                 group=group,
                 group_ids=group_ids,
-                job_id=implicit_job_id,  # Propagate job_id to child traces
+                job_id=job_id,
                 api_key=api_key,
                 code_snippet=code_snippet,
                 max_concurrent=max_concurrent,
@@ -301,20 +303,11 @@ async def run_eval(
                 quiet=quiet,
             )
 
-            # Create summary context (no trace, just aggregates results)
-            if tasks:
-                # Create summary from first task
-                ctx = EvalContext(
-                    name=eval_name,  # Use the same smart name
-                    api_key=api_key,
-                    job_id=implicit_job_id,
-                )
-            else:
-                ctx = EvalContext(
-                    name="eval",
-                    api_key=api_key,
-                    job_id=implicit_job_id,
-                )
+            ctx = EvalContext(
+                name=eval_name,
+                api_key=api_key,
+                job_id=job_id,
+            )
 
             ctx._is_summary = True  # Skip trace tracking
             ctx.results = completed

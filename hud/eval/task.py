@@ -26,7 +26,8 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import (
     BaseModel,
@@ -53,6 +54,9 @@ class TaskAgentConfig(BaseModel):
     """Agent configuration for a Task.
 
     Contains settings that should be passed to the agent when running this task.
+
+    Note: allowed_tools/disallowed_tools are handled at the Environment level
+    (via env.include()/env.exclude() for v5, or extracted by build_env_from_v4() for v4).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -62,12 +66,26 @@ class TaskAgentConfig(BaseModel):
         description="Custom system prompt to pass to the agent",
     )
 
+    # Agent behavior settings (from v4 agent_config, applied by EvalContext)
+    append_setup_output: bool = Field(
+        default=False,
+        description="Append setup tool output to the agent's initial prompt",
+    )
+    append_setup_tool: bool = Field(
+        default=False,
+        description="Alias for append_setup_output (backwards compat)",
+    )
+
     @model_validator(mode="before")
     @classmethod
     def warn_extra_fields(cls, data: Any) -> Any:
         """Warn about extra fields that will be ignored."""
         if isinstance(data, dict):
-            known_fields = {"system_prompt"}
+            known_fields = {
+                "system_prompt",
+                "append_setup_output",
+                "append_setup_tool",
+            }
             extra = set(data.keys()) - known_fields
             if extra:
                 logger.warning(
@@ -108,7 +126,8 @@ class Task(BaseModel):
     When entered as a context manager, creates an EvalContext.
 
     Attributes:
-        id: Optional task identifier for filtering/tracking
+        id: Internal platform task version identifier
+        slug: Stable user-defined task identifier for filtering and sync
         env: Environment instance (auto-created from dict/EnvConfig via validator)
         scenario: Scenario name to run (from @env.scenario)
         args: Scenario arguments
@@ -147,8 +166,19 @@ class Task(BaseModel):
     # Fields - env accepts Environment | EnvConfig | dict, auto-converts to Environment
     env: Any = Field(default=None)  # Typed as Any for input flexibility, validated below
     scenario: str | None = None
-    id: str | None = None
-    args: dict[str, Any] = Field(default_factory=dict)
+    id: str | None = Field(
+        default=None,
+        description="Internal platform task version ID. Reserved for platform-assigned values.",
+    )
+    slug: str | None = Field(
+        default=None,
+        max_length=20,
+        description="Stable task slug for task filtering and sync workflows.",
+    )
+    args: dict[str, Any] | None = Field(
+        default=None,
+        description="Scenario arguments. None indicates a template (args filled in later).",
+    )
     validation: list[MCPToolCall] | None = None
 
     # Agent config - settings passed to agent (system_prompt, etc.)
@@ -284,8 +314,20 @@ class Task(BaseModel):
                 ]
 
             # Preserve agent_config
+            agent_config: dict[str, Any] = {}
             if data.get("agent_config"):
-                result["agent_config"] = data["agent_config"]
+                agent_config.update(data["agent_config"])
+            # Restore tool filters from Environment (they were extracted during v4 conversion)
+            if self.env is not None:
+                if getattr(self.env, "_agent_include", None) is not None:
+                    agent_config["allowed_tools"] = self.env._agent_include
+                elif "allowed_tools" not in agent_config:
+                    # ["*"] was converted to None, restore it for serialization
+                    agent_config["allowed_tools"] = ["*"]
+                if getattr(self.env, "_agent_exclude", None) is not None:
+                    agent_config["disallowed_tools"] = self.env._agent_exclude
+            if agent_config:
+                result["agent_config"] = agent_config
 
             # Preserve metadata
             if data.get("metadata"):
@@ -294,6 +336,9 @@ class Task(BaseModel):
             # Preserve id
             if data.get("id"):
                 result["id"] = data["id"]
+            # Preserve slug
+            if data.get("slug"):
+                result["slug"] = data["slug"]
 
             return result
 
@@ -325,16 +370,57 @@ class Task(BaseModel):
         # Model validator handles v4 detection and conversion
         return cls(**source)
 
-    def copy(self) -> Task:
+    def copy(
+        self,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+        update: dict[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Task:
         """Create a copy of this Task config.
 
         Note: env is shared (not deep copied) since Environment instances
         should be reused. Args and validation are deep copied.
+        Task identity fields (id, slug) are reset unless explicitly provided
+        in ``update``.
         """
+        update_data = dict(update or {})
+        update_data.setdefault("id", None)
+        update_data.setdefault("slug", None)
+
+        if include is not None or exclude is not None:
+            # BaseModel.model_copy() does not support include/exclude. Build
+            # through dump+validate to preserve callers that rely on filtering.
+            data = self.model_dump(mode="python", include=include, exclude=exclude)
+            if deep:
+                if isinstance(data.get("args"), dict):
+                    data["args"] = deepcopy(data["args"])
+                if isinstance(data.get("validation"), list):
+                    data["validation"] = deepcopy(data["validation"])
+            data.update(update_data)
+            return cast("Task", type(self).model_validate(data))
+
+        if update is not None or deep:
+            # Preserve validation and env-sharing semantics.
+            data = self.model_dump(mode="python")
+            # Keep the existing Environment reference unless explicitly overridden.
+            if "env" not in update_data:
+                data["env"] = self.env
+            if isinstance(data.get("args"), dict):
+                data["args"] = deepcopy(data["args"]) if deep else data["args"].copy()
+            if isinstance(data.get("validation"), list):
+                data["validation"] = (
+                    deepcopy(data["validation"]) if deep else data["validation"].copy()
+                )
+            data.update(update_data)
+            return cast("Task", type(self).model_validate(data))
+
         return Task(
-            id=self.id,
+            id=None,
+            slug=None,
             env=self.env,  # Share reference
             scenario=self.scenario,
-            args=self.args.copy() if self.args else {},
+            args=self.args.copy() if self.args is not None else None,
             validation=self.validation.copy() if self.validation else None,
         )

@@ -49,8 +49,8 @@ class TestEvalContextTelemetry:
             """Say hello."""
             return f"Hello, {name}!"
 
-        # Create task from environment
-        task = Task(env=env)
+        # Create task from environment (args={} = runnable, args=None = template)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.settings.settings") as mock_settings,
@@ -62,7 +62,7 @@ class TestEvalContextTelemetry:
             mock_settings.hud_telemetry_url = "https://api.hud.ai"
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 result = await ctx.call_tool("greet", name="World")
                 # call_tool returns MCPToolResult with formatted content
                 assert "Hello, World!" in str(result)
@@ -110,7 +110,7 @@ class TestEvalContextTelemetry:
             """Always fails."""
             raise ValueError("Tool error")
 
-        task = Task(env=env)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.settings.settings") as mock_settings,
@@ -122,7 +122,7 @@ class TestEvalContextTelemetry:
             mock_settings.hud_telemetry_url = "https://api.hud.ai"
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 # Tool errors are wrapped in ToolError
                 with pytest.raises(Exception, match="Tool error"):
                     await ctx.call_tool("failing_tool")
@@ -162,7 +162,7 @@ class TestEvalContextTelemetry:
             """Multiply two numbers."""
             return a * b
 
-        task = Task(env=env)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.settings.settings") as mock_settings,
@@ -174,7 +174,7 @@ class TestEvalContextTelemetry:
             mock_settings.hud_telemetry_url = "https://api.hud.ai"
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 r1 = await ctx.call_tool("add", a=2, b=3)
                 r2 = await ctx.call_tool("multiply", a=4, b=5)
                 # Results are MCPToolResult objects
@@ -195,7 +195,7 @@ class TestEvalContextTelemetry:
         async def simple_tool() -> str:
             return "done"
 
-        task = Task(env=env)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.eval.context.flush") as mock_flush,
@@ -206,7 +206,7 @@ class TestEvalContextTelemetry:
             mock_settings.telemetry_enabled = True
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 await ctx.call_tool("simple_tool")
                 trace_id = ctx.trace_id
 
@@ -229,7 +229,7 @@ class TestEvalContextTelemetry:
         async def test_tool() -> str:
             return "ok"
 
-        task = Task(env=env)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.settings.settings") as mock_settings,
@@ -241,7 +241,7 @@ class TestEvalContextTelemetry:
             mock_settings.hud_telemetry_url = "https://api.hud.ai"
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 await ctx.call_tool("test_tool")
 
             await asyncio.sleep(0.1)
@@ -272,7 +272,7 @@ class TestSpanFormat:
         async def echo(message: str) -> str:
             return message
 
-        task = Task(env=env)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.settings.settings") as mock_settings,
@@ -284,7 +284,7 @@ class TestSpanFormat:
             mock_settings.hud_telemetry_url = "https://api.hud.ai"
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 await ctx.call_tool("echo", message="test")
 
             await asyncio.sleep(0.2)
@@ -329,7 +329,7 @@ class TestSpanFormat:
         async def noop() -> None:
             pass
 
-        task = Task(env=env)
+        task = Task(env=env, args={})
 
         with (
             patch("hud.settings.settings") as mock_settings,
@@ -341,7 +341,7 @@ class TestSpanFormat:
             mock_settings.hud_telemetry_url = "https://api.hud.ai"
             mock_settings.hud_api_url = "https://api.hud.ai"
 
-            async with hud.eval(task) as ctx:
+            async with hud.eval(task, quiet=True) as ctx:
                 await ctx.call_tool("noop")
 
             await asyncio.sleep(0.2)

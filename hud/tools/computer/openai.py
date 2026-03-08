@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from mcp import ErrorData, McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ContentBlock, TextContent
 from pydantic import Field
 
 from hud.tools.computer.settings import computer_settings
+from hud.tools.native_types import NativeToolSpec, NativeToolSpecs
 from hud.tools.types import ContentResult, Coordinate
+from hud.types import AgentType
 
 from .hud import HudComputerTool
 
@@ -52,6 +54,20 @@ class OpenAIComputerTool(HudComputerTool):
     OpenAI Computer Use tool for interacting with the computer.
     """
 
+    native_specs: ClassVar[NativeToolSpecs] = {
+        AgentType.OPENAI: NativeToolSpec(
+            api_type="computer",
+            api_name="computer",
+            role="computer",
+            supported_models=("gpt-5.4*",),
+        ),
+        AgentType.OPERATOR: NativeToolSpec(
+            api_type="computer_use_preview",
+            api_name="computer",
+            role="computer",
+        ),
+    }
+
     def __init__(
         self,
         # Define within environment based on platform
@@ -71,13 +87,33 @@ class OpenAIComputerTool(HudComputerTool):
         Initialize with OpenAI's default dimensions.
 
         Args:
-            width: Target width for rescaling (default: 1024 for OpenAI)
-            height: Target height for rescaling (default: 768 for OpenAI)
+            width: Width for agent coordinate system (default: 1024)
+            height: Height for agent coordinate system (default: 768)
             rescale_images: If True, rescale screenshots. If False, only rescale action coordinates
             name: Tool name for MCP registration (auto-generated from class name if not provided)
             title: Human-readable display name for the tool (auto-generated from class name)
             description: Tool description (auto-generated from docstring if not provided)
         """
+        # Create instance-level native_specs with display dimensions
+        # GA computer (OpenAI) needs no display dims; preview (Operator) keeps them
+        instance_native_specs = {
+            AgentType.OPENAI: NativeToolSpec(
+                api_type="computer",
+                api_name="computer",
+                role="computer",
+                supported_models=("gpt-5.4*",),
+            ),
+            AgentType.OPERATOR: NativeToolSpec(
+                api_type="computer_use_preview",
+                api_name="computer",
+                role="computer",
+                extra={
+                    "display_width": width,
+                    "display_height": height,
+                },
+            ),
+        }
+
         super().__init__(
             executor=executor,
             platform_type=platform_type,
@@ -88,8 +124,10 @@ class OpenAIComputerTool(HudComputerTool):
             name=name or "openai_computer",
             title=title or "OpenAI Computer Tool",
             description=description or "Control computer with mouse, keyboard, and screenshots",
+            native_specs=instance_native_specs,
             **kwargs,
         )
+        self._suppress_screenshot = False
 
     def _map_openai_key_to_cla(self, key: str) -> str:
         """Map OpenAI key name to CLA standard key."""
@@ -110,7 +148,8 @@ class OpenAIComputerTool(HudComputerTool):
             "drag",
             "response",
             "custom",
-        ] = Field(..., description="The action type to perform"),
+        ]
+        | None = Field(None, description="The action type to perform"),
         # Coordinate parameters
         x: int | None = Field(None, description="X coordinate for click/move/scroll actions"),
         y: int | None = Field(None, description="Y coordinate for click/move/scroll actions"),
@@ -133,35 +172,56 @@ class OpenAIComputerTool(HudComputerTool):
         ),
         # Custom action parameter
         action: str | None = Field(None, description="Custom action name"),
+        # Batch actions (GA computer tool)
+        actions: list[dict] | None = Field(None, description="Batch of actions to execute"),
     ) -> list[ContentBlock]:
         """
         Handle OpenAI Computer Use API calls.
 
         This converts OpenAI's action format (based on OperatorAdapter) to HudComputerTool's format.
+        Supports batched actions from the GA computer tool API.
 
         Returns:
             List of MCP content blocks
         """
+        # Handle batched actions (GA computer tool)
+        if isinstance(actions, list):
+            if not actions:
+                raise McpError(ErrorData(code=INVALID_PARAMS, message="actions list is empty"))
+            try:
+                result_blocks: list[ContentBlock] = []
+                for i, action_dict in enumerate(actions):
+                    is_last = i == len(actions) - 1
+                    self._suppress_screenshot = not is_last
+                    result_blocks = await self(**action_dict)
+                return result_blocks
+            finally:
+                self._suppress_screenshot = False
+
+        if type is None:
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="type is required"))
+
         logger.info("OpenAIComputerTool received type: %s", type)
+        take_ss = not self._suppress_screenshot
 
         # Process based on action type
         if type == "screenshot":
             screenshot_base64 = await self.executor.screenshot()
             if screenshot_base64:
-                # Rescale screenshot if requested
                 result = ContentResult(base64_image=screenshot_base64)
             else:
                 result = ContentResult(error="Failed to take screenshot")
 
         elif type == "click":
             if x is not None and y is not None:
-                # Cast button to proper literal type
                 button_literal = cast(
                     "Literal['left', 'right', 'middle', 'back', 'forward']", button or "left"
                 )
                 scaled_x, scaled_y = self._scale_coordinates(x, y)
                 logger.info("Scaled coordinates: %s, %s", scaled_x, scaled_y)
-                result = await self.executor.click(x=scaled_x, y=scaled_y, button=button_literal)
+                result = await self.executor.click(
+                    x=scaled_x, y=scaled_y, button=button_literal, take_screenshot=take_ss
+                )
             else:
                 raise McpError(
                     ErrorData(code=INVALID_PARAMS, message="x and y coordinates required for click")
@@ -169,10 +229,13 @@ class OpenAIComputerTool(HudComputerTool):
 
         elif type == "double_click":
             if x is not None and y is not None:
-                # Use pattern for double-click
                 scaled_x, scaled_y = self._scale_coordinates(x, y)
                 result = await self.executor.click(
-                    x=scaled_x, y=scaled_y, button="left", pattern=[100]
+                    x=scaled_x,
+                    y=scaled_y,
+                    button="left",
+                    pattern=[100],
+                    take_screenshot=take_ss,
                 )
             else:
                 raise McpError(
@@ -189,25 +252,30 @@ class OpenAIComputerTool(HudComputerTool):
                     )
                 )
 
-            # scroll_x and scroll_y default to 0 if not provided
             scaled_x, scaled_y = self._scale_coordinates(x, y)
             result = await self.executor.scroll(
-                x=scaled_x, y=scaled_y, scroll_x=scroll_x or 0, scroll_y=scroll_y or 0
+                x=scaled_x,
+                y=scaled_y,
+                scroll_x=scroll_x or 0,
+                scroll_y=scroll_y or 0,
+                take_screenshot=take_ss,
             )
 
         elif type == "type":
             if text is None:
                 raise McpError(ErrorData(code=INVALID_PARAMS, message="text is required for type"))
-            result = await self.executor.write(text=text, enter_after=False)
+            result = await self.executor.write(
+                text=text, enter_after=False, take_screenshot=take_ss
+            )
 
         elif type == "wait":
             wait_time = ms or 1000  # Default to 1 second
-            result = await self.executor.wait(time=wait_time)
+            result = await self.executor.wait(time=wait_time, take_screenshot=take_ss)
 
         elif type == "move":
             if x is not None and y is not None:
                 scaled_x, scaled_y = self._scale_coordinates(x, y)
-                result = await self.executor.move(x=scaled_x, y=scaled_y)
+                result = await self.executor.move(x=scaled_x, y=scaled_y, take_screenshot=take_ss)
             else:
                 raise McpError(
                     ErrorData(code=INVALID_PARAMS, message="x and y coordinates required for move")
@@ -219,13 +287,12 @@ class OpenAIComputerTool(HudComputerTool):
                     ErrorData(code=INVALID_PARAMS, message="keys is required for keypress")
                 )
 
-            # Map OpenAI keys to CLA standard
             cla_keys = []
             for key in keys:
                 cla_key = self._map_openai_key_to_cla(key)
                 cla_keys.append(cla_key)
 
-            result = await self.executor.press(keys=cla_keys)
+            result = await self.executor.press(keys=cla_keys, take_screenshot=take_ss)
 
         elif type == "drag":
             if path is None or len(path) < 2:
@@ -235,22 +302,18 @@ class OpenAIComputerTool(HudComputerTool):
                     )
                 )
 
-            # Convert path from list of Coordinate objects to list of tuples
             drag_path = [(point.x, point.y) for point in path]
-
             scaled_path = self._scale_path(drag_path)
-            result = await self.executor.drag(path=scaled_path)
+            result = await self.executor.drag(path=scaled_path, take_screenshot=take_ss)
 
         elif type == "response":
             if text is None:
                 raise McpError(
                     ErrorData(code=INVALID_PARAMS, message="text is required for response")
                 )
-            # Response returns content blocks directly
             return [TextContent(text=text, type="text")]
 
         elif type == "custom":
-            # For custom actions, we just return an error since HudComputerTool doesn't support them
             raise McpError(
                 ErrorData(code=INVALID_PARAMS, message=f"Custom action not supported: {action}")
             )
@@ -277,14 +340,14 @@ class OpenAIComputerTool(HudComputerTool):
         }
 
         if (
-            type in screenshot_actions
+            take_ss
+            and type in screenshot_actions
             and type != "screenshot"
             and isinstance(result, ContentResult)
             and not result.base64_image
         ):
             screenshot_base64 = await self.executor.screenshot()
             if screenshot_base64:
-                # Rescale screenshot if requested
                 screenshot_base64 = await self._rescale_screenshot(screenshot_base64)
                 result = ContentResult(
                     output=result.output, error=result.error, base64_image=screenshot_base64

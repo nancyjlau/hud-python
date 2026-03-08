@@ -51,10 +51,6 @@ class SingleTaskRequest(BaseModel):
         description="Additional metadata to inject into the trace context.",
     )
     trace_id: str | None = Field(default=None, description="Pre-assigned trace ID.")
-    use_byok: bool = Field(
-        default=False,
-        description="If True, use BYOK headers from encrypted env vars for inference.",
-    )
 
     @model_validator(mode="after")
     def _validate_task(self) -> SingleTaskRequest:
@@ -92,14 +88,25 @@ class BatchRequest(BaseModel):
     )
 
 
+def _normalize_task_dict(task_dict: dict[str, Any]) -> dict[str, Any]:
+    """Normalize API/internal task identity fields to SDK slug."""
+    normalized = dict(task_dict)
+    if not normalized.get("slug"):
+        external_id = normalized.get("external_id")
+        if isinstance(external_id, str) and external_id:
+            normalized["slug"] = external_id
+    normalized.pop("external_id", None)
+    return normalized
+
+
 def _normalize_tasks(tasks: Sequence[TaskInput]) -> list[dict[str, Any]]:
     """Convert tasks to list of dicts for remote API submission."""
     result = []
     for t in tasks:
         if isinstance(t, dict):
-            result.append(t)
+            result.append(_normalize_task_dict(t))
         elif hasattr(t, "model_dump"):
-            result.append(t.model_dump(mode="json"))
+            result.append(_normalize_task_dict(t.model_dump(mode="json")))
         else:
             raise TypeError(f"Cannot convert {type(t).__name__} to dict")
     return result
@@ -114,9 +121,10 @@ async def submit_rollouts(
     group_size: int = 1,
     batch_size: int = 50,
     metadata: dict[str, Any] | None = None,
-    use_byok: bool = False,
-) -> None:
-    """Submit rollouts to the HUD platform API for remote execution (fire-and-forget).
+) -> list[str]:
+    """Submit rollouts to the HUD platform API for remote execution.
+
+    Returns the list of trace_ids for tracking.
 
     Args:
         tasks: List of tasks (v5 Task, v4 LegacyTask, or dicts)
@@ -127,7 +135,6 @@ async def submit_rollouts(
         group_size: Number of rollouts per task (for variance estimation)
         batch_size: Number of rollouts per API batch request
         metadata: Additional metadata for each rollout
-        use_byok: If True, use BYOK keys from encrypted env vars (remote only)
     """
     from hud.eval.utils import is_v4_format
 
@@ -149,16 +156,18 @@ async def submit_rollouts(
                 and not server_cfg.get("url")
             )
             if is_local:
+                task_label = td.get("slug") or td.get("id") or i
                 raise ValueError(
                     f"Remote execution requires URL-based mcp_config. "
-                    f"Task {td.get('id') or i} uses local Docker config for '{server_name}'. "
+                    f"Task {task_label} uses local Docker config for '{server_name}'. "
                     "Convert to remote with: hud convert <tasks_file>"
                 )
 
     # Build single task requests
     requests: list[SingleTaskRequest] = []
     for task_idx, td in enumerate(task_dicts):
-        base_task_id = td.get("id") or f"task_{task_idx}"
+        base_task_id = td.get("slug") or td.get("id") or f"task_{task_idx}"
+        base_task_id = str(base_task_id)
         trace_name = td.get("prompt") or td.get("scenario") or base_task_id
 
         for rollout_idx in range(group_size):
@@ -174,7 +183,6 @@ async def submit_rollouts(
                     trace_name=trace_name,
                     group_id=base_task_id if group_size > 1 else None,
                     metadata=metadata or {},
-                    use_byok=use_byok,
                 )
             )
 
@@ -184,6 +192,7 @@ async def submit_rollouts(
 
     total_accepted = 0
     total_rejected = 0
+    trace_ids: list[str] = []
 
     async with httpx.AsyncClient(timeout=120) as client:
         for i in range(0, len(requests), batch_size):
@@ -203,8 +212,12 @@ async def submit_rollouts(
                 total_rejected += result.get("rejected", 0)
 
                 for item in result.get("results", []):
-                    if isinstance(item, dict) and item.get("status") == "rejected":
-                        hud_console.warning(f"Task rejected: {item.get('error', 'Unknown reason')}")
+                    if isinstance(item, dict):
+                        if item.get("status") == "rejected":
+                            error = item.get("error", "Unknown reason")
+                            hud_console.warning(f"Task rejected: {error}")
+                        elif item.get("trace_id"):
+                            trace_ids.append(item["trace_id"])
 
                 batch_num = (i // batch_size) + 1
                 total_batches = (len(requests) + batch_size - 1) // batch_size
@@ -231,6 +244,8 @@ async def submit_rollouts(
     else:
         hud_console.info(f"Submitted {total_accepted}/{len(requests)} requests")
 
+    return trace_ids
+
 
 async def cancel_job(job_id: str) -> dict[str, Any]:
     """Cancel all tasks for a specific job.
@@ -254,23 +269,15 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
         return response.json()
 
 
-async def cancel_task(job_id: str, task_id: str) -> dict[str, Any]:
-    """Cancel a specific task within a job.
-
-    Args:
-        job_id: The job ID
-        task_id: The specific task ID to cancel
-
-    Returns:
-        Response with cancellation result
-    """
+async def cancel_task(job_id: str, trace_id: str) -> dict[str, Any]:
+    """Cancel a specific task run within a job."""
     api_url = f"{settings.hud_api_url.rstrip('/')}/v1/rollouts/cancel"
     headers = {"Authorization": f"Bearer {settings.api_key}"}
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             api_url,
-            json={"job_id": job_id, "task_id": task_id},
+            json={"job_id": job_id, "trace_id": trace_id},
             headers=headers,
         )
         response.raise_for_status()

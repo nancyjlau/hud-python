@@ -16,7 +16,7 @@ from rich.tree import Tree
 from hud.utils.hud_console import HUDConsole
 
 if TYPE_CHECKING:
-    from hud.clients import MCPClient
+    from fastmcp import Client
 
 console = Console()
 
@@ -33,25 +33,21 @@ class InteractiveMCPTester:
         """
         self.server_url = server_url
         self.verbose = verbose
-        self.client: MCPClient | None = None
+        self.client: Client | None = None
         self.tools: list[Any] = []
         self.console = HUDConsole()
 
     async def connect(self) -> bool:
         """Connect to the MCP server."""
         try:
-            # Lazy import to avoid loading mcp_use on simple CLI commands
-            from hud.clients import MCPClient
+            from fastmcp import Client as FastMCPClient
 
             # Create MCP config for HTTP transport
-            # Note: We explicitly set auth to None to prevent OAuth discovery attempts
+            # Note: auth=None prevents OAuth discovery attempts on local servers
             config = {"server": {"url": self.server_url, "auth": None}}
 
-            self.client = MCPClient(
-                mcp_config=config,
-                verbose=self.verbose,
-            )
-            await self.client.initialize()
+            self.client = FastMCPClient(transport=config)
+            await self.client.__aenter__()
 
             # Fetch available tools
             self.tools = await self.client.list_tools()
@@ -59,13 +55,14 @@ class InteractiveMCPTester:
             return True
         except Exception as e:
             self.console.error(f"Failed to connect: {e}")
+            await self.disconnect()
             return False
 
     async def disconnect(self) -> None:
         """Disconnect from the MCP server."""
-        if self.client:
-            await self.client.shutdown()
-            self.client = None
+        if self.client and self.client.is_connected():
+            await self.client.close()
+        self.client = None
 
     def display_tools(self) -> None:
         """Display available tools in a nice format."""
@@ -293,14 +290,16 @@ class InteractiveMCPTester:
                     value_str = await questionary.text(
                         prompt,
                         default="",
-                        validate=lambda text, pt=prop_type, req=is_required: True
-                        if not text and not req
-                        else (
-                            text.replace("-", "").replace(".", "").isdigit()
-                            if pt == "number"
-                            else text.replace("-", "").isdigit()
-                        )
-                        or f"Please enter a valid {pt}",
+                        validate=lambda text, pt=prop_type, req=is_required: (
+                            True
+                            if not text and not req
+                            else (
+                                text.replace("-", "").replace(".", "").isdigit()
+                                if pt == "number"
+                                else text.replace("-", "").isdigit()
+                            )
+                            or f"Please enter a valid {pt}"
+                        ),
                     ).unsafe_ask_async()
                     if not value_str and not is_required:
                         continue
@@ -364,7 +363,7 @@ class InteractiveMCPTester:
             # Display results
             console.print("\n[green]✓ Tool executed successfully[/green]")
 
-            if result.isError:
+            if result.is_error:
                 console.print("[red]Error result:[/red]")
 
             # Display content blocks
@@ -374,7 +373,7 @@ class InteractiveMCPTester:
                         Panel(
                             content.text,
                             title="Result",
-                            border_style="green" if not result.isError else "red",
+                            border_style="green" if not result.is_error else "red",
                         )
                     )
                 elif isinstance(content, ImageContent):
@@ -384,7 +383,7 @@ class InteractiveMCPTester:
                         Panel(
                             f"📷 Image ({mime_type})\nSize: {data_length:,} bytes (base64 encoded)",
                             title="Result",
-                            border_style="green" if not result.isError else "red",
+                            border_style="green" if not result.is_error else "red",
                         )
                     )
                 else:
@@ -431,22 +430,7 @@ class InteractiveMCPTester:
             console.print("\n[cyan]Disconnecting...[/cyan]")
             await self.disconnect()
 
-            # Show next steps tutorial
-            self.console.section_title("Next Steps")
-            self.console.info("🏗️  Ready to test with real agents? Run:")
-            self.console.info("    [cyan]hud build[/cyan]")
-            self.console.info("")
-            self.console.info("This will:")
-            self.console.info("  1. Build your environment image")
-            self.console.info("  2. Generate a hud.lock.yaml file")
-            self.console.info("  3. Prepare it for testing with agents")
-            self.console.info("")
-            self.console.info("Then you can:")
-            self.console.info("  • Test locally: [cyan]hud run <image>[/cyan]")
-            self.console.info("  • Push to registry: [cyan]hud push --image <registry/name>[/cyan]")
-            self.console.info("  • Use with agents via the lock file")
-
-            console.print("\n[dim]Happy testing! 🎉[/dim]")
+            self.console.info("Session ended.")
 
 
 async def run_interactive_mode(server_url: str, verbose: bool = False) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from copy import deepcopy
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -68,16 +70,42 @@ class Connector:
         self.connection_type = connection_type
         self.client: FastMCPClient[Any] | None = None
         self._tools_cache: list[mcp_types.Tool] | None = None
+        self._prompts_cache: list[mcp_types.Prompt] | None = None
+        self._resources_cache: list[mcp_types.Resource] | None = None
 
     def copy(self) -> Connector:
         """Create a copy of this connector with fresh (unconnected) state.
 
-        The copy shares transport config but has its own client instance,
-        allowing parallel execution without conflicts.
+        The copy uses a fresh transport object and client instance so mutable
+        transport/session state cannot leak across parallel traces.
         """
+        copied_transport = deepcopy(self._transport)
+        copied_config = ConnectionConfig(
+            prefix=self.config.prefix,
+            include=list(self.config.include) if self.config.include is not None else None,
+            exclude=list(self.config.exclude) if self.config.exclude is not None else None,
+            transform=self.config.transform,
+        )
+        from hud.utils.mcp import _is_hud_server
+
+        url = getattr(copied_transport, "url", None)
+        headers = getattr(copied_transport, "headers", None)
+        if isinstance(copied_transport, dict):
+            url = copied_transport.get("url")
+            headers = copied_transport.get("headers")
+        if (
+            isinstance(url, str)
+            and _is_hud_server(url)
+            and isinstance(headers, dict)
+            and (headers.get("Environment-Name") or headers.get("environment-name"))
+        ):
+            env_name = headers.get("Environment-Name") or headers["environment-name"]
+            headers["Environment-Name"] = env_name
+            headers["Environment-Id"] = str(uuid.uuid4())
+
         return Connector(
-            transport=self._transport,
-            config=self.config,
+            transport=copied_transport,
+            config=copied_config,
             name=self.name,
             connection_type=self.connection_type,
             auth=self._auth,
@@ -101,6 +129,14 @@ class Connector:
     def cached_tools(self) -> list[mcp_types.Tool]:
         return self._tools_cache or []
 
+    @property
+    def cached_prompts(self) -> list[mcp_types.Prompt]:
+        return self._prompts_cache or []
+
+    @property
+    def cached_resources(self) -> list[mcp_types.Resource]:
+        return self._resources_cache or []
+
     async def connect(self) -> None:
         """Create FastMCP client and connect.
 
@@ -110,22 +146,31 @@ class Connector:
         """
         from fastmcp.client import Client as FastMCPClient
 
-        # Create fresh client from stored transport config
-        self.client = FastMCPClient(transport=self._transport, auth=self._auth)
+        self.client = FastMCPClient(
+            transport=self._transport,
+            auth=self._auth,
+        )
         await self.client.__aenter__()
 
     async def disconnect(self) -> None:
-        """Disconnect and clear cache."""
+        """Disconnect and clear all caches."""
         if self.client is not None and self.is_connected:
             await self.client.__aexit__(None, None, None)
         self.client = None
         self._tools_cache = None
+        self._prompts_cache = None
+        self._resources_cache = None
 
     async def list_tools(self) -> list[mcp_types.Tool]:
-        """Fetch tools from server, apply filters/transforms/prefix, and cache."""
-        if self.client is None:
+        """Fetch tools from server, apply filters/transforms/prefix, and cache.
+
+        Always fetches fresh data from the server (no caching check).
+        The result is cached for use by router.build() via cached_tools property.
+        """
+        client = self.client
+        if client is None:
             raise RuntimeError("Not connected - call connect() first")
-        tools = await self.client.list_tools()
+        tools = await client.list_tools()
 
         result: list[mcp_types.Tool] = []
         for tool in tools:
@@ -147,21 +192,18 @@ class Connector:
                 transformed = self.config.transform(fastmcp_tool)
                 if transformed is None:
                     continue
-                tool = mcp_types.Tool(
-                    name=transformed.name,
-                    description=transformed.description,
-                    inputSchema=transformed.parameters,
+                tool = tool.model_copy(
+                    update={
+                        "name": transformed.name,
+                        "description": transformed.description,
+                        "inputSchema": transformed.parameters,
+                    }
                 )
 
             # Apply prefix
-            name = f"{self.config.prefix}_{tool.name}" if self.config.prefix else tool.name
-            result.append(
-                mcp_types.Tool(
-                    name=name,
-                    description=tool.description,
-                    inputSchema=tool.inputSchema,
-                )
-            )
+            if self.config.prefix:
+                tool = tool.model_copy(update={"name": f"{self.config.prefix}_{tool.name}"})
+            result.append(tool)
 
         self._tools_cache = result
         return result
@@ -170,22 +212,98 @@ class Connector:
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> mcp_types.CallToolResult:
         """Call a tool, stripping prefix if needed."""
-        if self.client is None:
+        client = self.client
+        if client is None:
             raise RuntimeError("Not connected - call connect() first")
         # Strip prefix when calling remote
         if self.config.prefix and name.startswith(f"{self.config.prefix}_"):
             name = name[len(self.config.prefix) + 1 :]
-        return await self.client.call_tool_mcp(name, arguments or {})
+
+        from hud.eval.context import get_current_trace_id
+
+        args = dict(arguments or {})
+        trace_id = get_current_trace_id()
+        meta = {"_hud_trace_id": trace_id} if trace_id else None
+
+        if meta:
+            try:
+                meta_kwargs: dict[str, Any] = {"meta": meta}
+                result = await client.call_tool(name=name, arguments=args, **meta_kwargs)
+            except TypeError as e:
+                if "unexpected keyword argument" not in str(e):
+                    raise
+                try:
+                    meta_kwargs = {"_meta": meta}
+                    result = await client.call_tool(name=name, arguments=args, **meta_kwargs)
+                except TypeError as e2:
+                    if "unexpected keyword argument" not in str(e2):
+                        raise
+                    result = await client.call_tool(name=name, arguments=args)
+        else:
+            result = await client.call_tool(name=name, arguments=args)
+
+        # FastMCP and mcp-python use slightly different result shapes/types.
+        # Normalize to mcp.types.CallToolResult for the rest of HUD.
+        is_error = getattr(result, "isError", None)
+        if is_error is None:
+            is_error = getattr(result, "is_error", False)
+        structured = getattr(result, "structuredContent", None)
+        if structured is None:
+            structured = getattr(result, "structured_content", None)
+
+        content = getattr(result, "content", None)
+        if content is None:
+            content = []
+
+        return mcp_types.CallToolResult(
+            content=content,
+            isError=bool(is_error),
+            structuredContent=structured,
+        )
 
     async def list_resources(self) -> list[mcp_types.Resource]:
+        """Fetch resources from server and cache.
+
+        Always fetches fresh data from the server (no caching check).
+        The result is cached for use by router.build_resources() via cached_resources property.
+
+        Note: resources/list is optional in the MCP spec. If the server doesn't
+        implement it, we return an empty list gracefully.
+        """
         if self.client is None:
             raise RuntimeError("Not connected - call connect() first")
-        return await self.client.list_resources()
+        try:
+            self._resources_cache = await self.client.list_resources()
+        except Exception as e:
+            # Handle servers that don't implement resources/list (optional in MCP spec)
+            if "Method not found" in str(e):
+                logger.debug("Server %s does not support resources/list", self.name)
+                self._resources_cache = []
+            else:
+                raise
+        return self._resources_cache
 
     async def list_prompts(self) -> list[mcp_types.Prompt]:
+        """Fetch prompts from server and cache.
+
+        Always fetches fresh data from the server (no caching check).
+        The result is cached for use by router.build_prompts() via cached_prompts property.
+
+        Note: prompts/list is optional in the MCP spec. If the server doesn't
+        implement it, we return an empty list gracefully.
+        """
         if self.client is None:
             raise RuntimeError("Not connected - call connect() first")
-        return await self.client.list_prompts()
+        try:
+            self._prompts_cache = await self.client.list_prompts()
+        except Exception as e:
+            # Handle servers that don't implement prompts/list (optional in MCP spec)
+            if "Method not found" in str(e):
+                logger.debug("Server %s does not support prompts/list", self.name)
+                self._prompts_cache = []
+            else:
+                raise
+        return self._prompts_cache
 
     async def read_resource(
         self, uri: str

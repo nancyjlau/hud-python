@@ -139,7 +139,7 @@ class TestPushEnvironment:
 
         assert exc_info.value.exit_code == 1
 
-    @mock.patch("requests.post")
+    @mock.patch("httpx.post")
     @mock.patch("subprocess.Popen")
     @mock.patch("subprocess.run")
     @mock.patch("hud.cli.push.get_docker_username")
@@ -160,7 +160,7 @@ class TestPushEnvironment:
         mock_hud_console = mock.Mock()
         mock_hud_console_class.return_value = mock_hud_console
         mock_settings.api_key = "test-key"
-        mock_settings.hud_telemetry_url = "https://api.hud.test"
+        mock_settings.hud_api_url = "https://api.hud.test"
         mock_get_username.return_value = "testuser"
 
         # Create lock file
@@ -343,7 +343,14 @@ class TestPushCommand:
     def test_push_command_basic(self):
         """Test basic push command."""
         with mock.patch("hud.cli.push.push_environment") as mock_push:
-            push_command()
+            push_command(
+                directory=".",
+                image=None,
+                tag=None,
+                sign=False,
+                yes=False,
+                verbose=False,
+            )
 
             mock_push.assert_called_once_with(".", None, None, False, False, False)
 

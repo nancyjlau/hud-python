@@ -7,14 +7,15 @@ from typing import Any, ClassVar
 
 import mcp.types as types
 from google.genai import types as genai_types
-from pydantic import ConfigDict, Field
 
 from hud.tools.computer.settings import computer_settings
-from hud.types import AgentResponse, BaseAgentConfig, MCPToolCall, MCPToolResult
+from hud.tools.native_types import NativeToolSpec
+from hud.types import AgentResponse, AgentType, BaseAgentConfig, MCPToolCall, MCPToolResult
 from hud.utils.types import with_signature
 
-from .base import BaseCreateParams, MCPAgent
-from .gemini import GeminiAgent, GeminiConfig
+from .base import MCPAgent
+from .gemini import GeminiAgent
+from .types import GeminiCUAConfig, GeminiCUACreateParams
 
 logger = logging.getLogger(__name__)
 
@@ -56,20 +57,6 @@ what they asked.
 """.strip()
 
 
-class GeminiCUAConfig(GeminiConfig):
-    """Configuration for `GeminiCUAAgent`."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    model_name: str = "GeminiCUA"
-    model: str = "gemini-2.5-computer-use-preview-10-2025"
-    excluded_predefined_functions: list[str] = Field(default_factory=list)
-
-
-class GeminiCUACreateParams(BaseCreateParams, GeminiCUAConfig):
-    pass
-
-
 class GeminiCUAAgent(GeminiAgent):
     """
     Gemini Computer Use Agent that extends GeminiAgent with computer use capabilities.
@@ -84,6 +71,36 @@ class GeminiCUAAgent(GeminiAgent):
     }
     required_tools: ClassVar[list[str]] = ["gemini_computer"]
     config_cls: ClassVar[type[BaseAgentConfig]] = GeminiCUAConfig
+
+    @classmethod
+    def agent_type(cls) -> AgentType:
+        """Return the AgentType for Gemini CUA."""
+        return AgentType.GEMINI_CUA
+
+    # Legacy tool name patterns for backwards compatibility
+    _LEGACY_COMPUTER_NAMES = ("gemini_computer", "computer")
+
+    def _legacy_native_spec_fallback(self, tool: types.Tool) -> NativeToolSpec | None:
+        """Detect Gemini CUA native tools by name for backwards compatibility.
+
+        Supports old environments that expose tools like 'gemini_computer'
+        without native_tools metadata.
+
+        Each tuple is ordered by preference — first name that exists wins.
+        Only returns a spec if this tool IS that preferred match.
+        """
+        available = {t.name for t in (self._available_tools or [])} | {tool.name}
+        preferred = lambda names: next((n for n in names if n in available), None) == tool.name
+
+        if preferred(self._LEGACY_COMPUTER_NAMES):
+            logger.debug("Legacy fallback: detected %s as computer_use tool", tool.name)
+            return NativeToolSpec(
+                api_type="computer_use",
+                api_name="gemini_computer",
+                role="computer",
+            )
+
+        return None
 
     @with_signature(GeminiCUACreateParams)
     @classmethod
@@ -112,16 +129,30 @@ class GeminiCUAAgent(GeminiAgent):
     def _to_gemini_tool(self, tool: types.Tool) -> genai_types.Tool | None:
         """Convert a single MCP tool to Gemini tool format.
 
-        Handles gemini_computer tool specially by using Gemini's native ComputerUse.
+        Handles computer_use tools specially by using Gemini's native ComputerUse.
+        Uses native_specs metadata first, falls back to name-based detection for
+        old environments.
         """
-        if tool.name == self._computer_tool_name:
-            # Use Gemini's native computer use capability
+        # Check for native spec (new approach) or legacy fallback
+        spec = self.resolve_native_spec(tool)
+
+        if spec and spec.api_type == "computer_use":
+            # This tool should use Gemini's native computer use capability
+            logger.debug("Using native ComputerUse for tool %s (via native_specs)", tool.name)
+            self._computer_tool_name = tool.name  # Track the actual MCP tool name
             return genai_types.Tool(
                 computer_use=genai_types.ComputerUse(
                     environment=genai_types.Environment.ENVIRONMENT_BROWSER,
                     excluded_predefined_functions=self.excluded_predefined_functions,
                 )
             )
+
+        # Skip other computer-like tools that don't have native specs for this agent
+        # (they may be meant for other agents like Claude or OpenAI)
+        tool_role = self.get_tool_role(tool)
+        if tool_role == "computer":
+            logger.debug("Skipping computer tool %s (no native_specs for gemini_cua)", tool.name)
+            return None
 
         # For non-computer tools, use the parent implementation
         return super()._to_gemini_tool(tool)

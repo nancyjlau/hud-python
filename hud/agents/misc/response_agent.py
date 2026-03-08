@@ -4,8 +4,10 @@ import logging
 from typing import Literal
 
 from openai import AsyncOpenAI
+from openai.types.responses import ResponseOutputText
 
 from hud.settings import settings
+from hud.telemetry import instrument
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +42,14 @@ class ResponseAgent:
 
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str = "gpt-5",
         system_prompt: str | None = None,
     ) -> None:
         """
         Initialize the ResponseAgent.
 
         Args:
-            model: The model to use via HUD inference gateway (default: "gpt-4o").
+            model: The model to use via HUD inference gateway (default: "gpt-5").
                    Supports any model available through inference.hud.ai.
             system_prompt: Optional custom system prompt for determining responses.
         """
@@ -64,6 +66,11 @@ class ResponseAgent:
         self.model = model
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
 
+    @instrument(
+        category="agent",
+        name="response_agent",
+        internal_type="user-message",
+    )
     async def determine_response(self, agent_message: str) -> ResponseType:
         """
         Determine whether the agent should stop or continue based on its message.
@@ -75,26 +82,37 @@ class ResponseAgent:
             ResponseType: Either "STOP" or "CONTINUE"
         """
         try:
-            response = await self.client.chat.completions.create(
+            response = await self.client.responses.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
+                instructions=self.system_prompt,
+                input=[
                     {
                         "role": "user",
-                        "content": f"Agent message: {agent_message}\n\nWhat is the appropriate response?",  # noqa: E501
+                        "content": (
+                            f"Agent message: {agent_message}\n\nWhat is the appropriate response?"
+                        ),
                     },
                 ],
-                temperature=0.1,
-                max_tokens=5,
+                reasoning={"effort": "low"},
+                max_output_tokens=256,
+                extra_headers={"Trace-Id": ""},
             )
 
-            response_text = response.choices[0].message.content
+            text_parts: list[str] = []
+            for item in response.output:
+                if item.type == "message":
+                    text_parts.extend(
+                        content.text
+                        for content in item.content
+                        if isinstance(content, ResponseOutputText)
+                    )
+
+            response_text = "".join(text_parts)
             if not response_text:
                 return "CONTINUE"
 
             response_text = response_text.strip().upper()
 
-            # Validate the response
             if "STOP" in response_text:
                 return "STOP"
             else:
@@ -102,4 +120,4 @@ class ResponseAgent:
 
         except Exception as e:
             logger.warning("Auto-respond failed: %s", e)
-            return "CONTINUE"  # Default to continue on error
+            return "CONTINUE"

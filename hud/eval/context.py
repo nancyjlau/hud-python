@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import uuid
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Self
 
 from hud.environment import Environment
@@ -20,9 +21,11 @@ from hud.shared import make_request
 from hud.telemetry import flush, instrument
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from types import TracebackType
 
     from hud.eval.task import Task
+    from hud.tools.types import EvaluationResult
     from hud.types import MCPToolResult
 
 
@@ -58,6 +61,20 @@ def get_current_trace_id() -> str | None:
     return None
 
 
+@contextmanager
+def set_trace_context(trace_id: str) -> Generator[None, None, None]:
+    """Temporarily set trace context from an external trace_id.
+
+    Used by MCP tool handlers to propagate parent trace context into sub-processes.
+    """
+    headers = {"Trace-Id": trace_id}
+    token = _current_trace_headers.set(headers)
+    try:
+        yield
+    finally:
+        _current_trace_headers.reset(token)
+
+
 def get_current_api_key() -> str | None:
     """Get the current API key override from context.
 
@@ -89,17 +106,13 @@ class EvalContext(Environment):
 
     Example:
         ```python
-        # From existing environment
-        async with env.eval("task") as ctx:
-            await ctx.call_tool("navigate", url="...")
-            ctx.reward = 0.9
-
-        # Standalone with slug
-        async with hud.eval("my-org/task:1") as ctx:
+        # With task (scenario sets reward automatically)
+        tasks = load_tasks("my-org/task:1")
+        async with hud.eval(tasks) as ctx:
             await agent.run(ctx)
-            ctx.reward = result.reward
+            # reward set by scenario evaluate phase in __aexit__
 
-        # Blank eval
+        # Blank eval (manual reward)
         async with hud.eval() as ctx:
             ctx.reward = compute_reward()
         ```
@@ -156,8 +169,12 @@ class EvalContext(Environment):
         # User-settable (per-run values, override Environment defaults)
         self.prompt: str | None = None  # From scenario setup or task
         self.reward: float | None = None
+        self.evaluation_result: EvaluationResult | None = None  # Full result with subscores
         self.answer: str | None = None  # Agent's submitted answer
         self.system_prompt: str | None = None  # From task.agent_config, passed to agent
+
+        # Agent config overrides from task (applied by agent when running)
+        self.append_setup_output: bool = False  # Whether to append setup tool output to prompt
 
         # Error tracking
         self.error: BaseException | None = None
@@ -229,15 +246,18 @@ class EvalContext(Environment):
         # Copy connections from parent - each connector is copied so parallel
         # execution gets fresh client instances
         ctx._connections = {name: connector.copy() for name, connector in env._connections.items()}
+
+        # Note: Auth is injected at request time by httpx/aiohttp hooks in hud.eval.instrument
+        # using the contextvar set in __aenter__ (supports api_key passed to hud.eval())
         ctx._setup_calls = env._setup_calls.copy()
         ctx._evaluate_calls = env._evaluate_calls.copy()
+        ctx._integration_test_calls = getattr(env, "_integration_test_calls", []).copy()
+        ctx._setup_results = getattr(env, "_setup_results", []).copy()
 
         # Copy scenarios (definitions) by reference - they don't change
         ctx._scenarios = getattr(env, "_scenarios", {})
         # Create fresh session state for this eval (parallel evals each need their own)
-        ctx._scenario_sessions = {}
-        ctx._scenario_latest = {}
-        ctx._scenario_answers = {}
+        ctx._active_session = None
 
         # Store source env name for remote scenario lookups
         ctx._source_env_name = env.name
@@ -303,9 +323,19 @@ class EvalContext(Environment):
             code_snippet: Code being evaluated
             trace: Whether to send traces to backend
             quiet: Whether to suppress output
+
+        Raises:
+            ValueError: If task.args is None (template tasks cannot be run directly)
         """
         from hud.environment import Environment
         from hud.eval.task import build_eval_name
+
+        # Validate that task has args (not a template)
+        if task.args is None:
+            raise ValueError(
+                f"Cannot run task with args=None (this is a template). "
+                f"Provide args when creating the task: env('{task.scenario}', **args)"
+            )
 
         eval_name = name or build_eval_name(task.scenario, task.args)
 
@@ -326,16 +356,35 @@ class EvalContext(Environment):
             quiet=quiet,
         )
 
+        # v5 validation overrides any environment-level integration calls.
+        if task.validation is not None:
+            ctx._integration_test_calls = [
+                (call.name, call.arguments or {}) for call in task.validation
+            ]
+
         # Store task info for scenario execution
         ctx._task = task
 
-        # Set system_prompt from task.agent_config
+        # Copy agent_config fields from task to ctx (these override agent defaults)
         if task.agent_config:
-            if isinstance(task.agent_config, dict):
-                if task.agent_config.get("system_prompt"):
-                    ctx.system_prompt = task.agent_config["system_prompt"]
-            elif task.agent_config.system_prompt:
-                ctx.system_prompt = task.agent_config.system_prompt
+            agent_config = task.agent_config
+            if isinstance(agent_config, dict):
+                if agent_config.get("system_prompt"):
+                    ctx.system_prompt = agent_config["system_prompt"]
+                if agent_config.get("append_setup_output"):
+                    ctx.append_setup_output = agent_config["append_setup_output"]
+                # Also check append_setup_tool alias
+                if agent_config.get("append_setup_tool"):
+                    ctx.append_setup_output = agent_config["append_setup_tool"]
+            else:
+                # It's a BaseAgentConfig or TaskAgentConfig object
+                if getattr(agent_config, "system_prompt", None):
+                    ctx.system_prompt = agent_config.system_prompt
+                if getattr(agent_config, "append_setup_output", False):
+                    ctx.append_setup_output = agent_config.append_setup_output
+                # Also check append_setup_tool alias
+                if getattr(agent_config, "append_setup_tool", False):
+                    ctx.append_setup_output = True
 
         return ctx
 
@@ -344,7 +393,7 @@ class EvalContext(Environment):
         if self._task is None or self._task.scenario is None:
             return
 
-        prompt = await self.run_scenario_setup(self._task.scenario, self._task.args)
+        prompt = await self.run_scenario_setup(self._task.scenario, self._task.args or {})
         if prompt:
             self.prompt = prompt
 
@@ -353,9 +402,14 @@ class EvalContext(Environment):
         if self._task is None or self._task.scenario is None:
             return
 
-        reward = await self.run_scenario_evaluate(self._task.scenario)
-        if reward is not None:
-            self.reward = reward
+        try:
+            result = await self.run_scenario_evaluate(self._task.scenario)
+        except Exception as e:
+            self.error = e
+            return
+
+        self.evaluation_result = result
+        self.reward = result.reward
 
     # =========================================================================
     # Summary Context - Attribute Access Control
@@ -417,6 +471,33 @@ class EvalContext(Environment):
     def has_scenario(self) -> bool:
         """True if a scenario is running and can accept submissions."""
         return self._task is not None and self._task.scenario is not None
+
+    @property
+    def setup_output(self) -> str | None:
+        """Get setup tool output as formatted string for prepending to agent context.
+
+        Returns None if no setup tools were executed or all results were empty.
+        Used by agents when append_setup_output is enabled.
+        """
+        import mcp.types as mcp_types
+
+        setup_results = getattr(self, "_setup_results", [])
+        if not setup_results:
+            return None
+
+        output_parts: list[str] = []
+        for result in setup_results:
+            if result.content:
+                output_parts.extend(
+                    block.text
+                    for block in result.content
+                    if isinstance(block, mcp_types.TextContent)
+                )
+
+        if not output_parts:
+            return None
+
+        return "\n".join(output_parts)
 
     # =========================================================================
     # Backend Integration
@@ -517,11 +598,17 @@ class EvalContext(Environment):
             reward = self.reward
 
         try:
+            eval_result_dict = (
+                self.evaluation_result.model_dump(exclude_none=True, exclude={"info"})
+                if self.evaluation_result
+                else None
+            )
             payload = EvalExitPayload(
                 **self._build_base_payload().model_dump(),
                 reward=reward,
                 success=self.success,
                 error_message=error_message,
+                evaluation_result=eval_result_dict,
             )
             await make_request(
                 method="POST",
@@ -542,29 +629,23 @@ class EvalContext(Environment):
             return self
 
         # Start tracking
-        self._token = _current_trace_headers.set(self.headers)
+        if self._trace_enabled:
+            self._token = _current_trace_headers.set(self.headers)
         self._api_key_token = _current_api_key.set(self._eval_api_key)
 
-        # Connect environment (MCP servers, tools)
-        await super().__aenter__()
+        # Register trace first (environment connection can fail)
+        await self._eval_enter()
 
         try:
+            # Connect environment (MCP servers, tools)
+            await super().__aenter__()
+
             # Run task scenario setup (if created from_task with scenario)
             await self._run_task_scenario_setup()
-
-            # Notify backend and print link
-            await self._eval_enter()
             self._print_eval_link()
-        except BaseException:
+        except BaseException as e:
             # Cleanup if setup fails - __aexit__ won't be called automatically
-            await super().__aexit__(None, None, None)
-            # Reset context vars
-            if self._token is not None:
-                _current_trace_headers.reset(self._token)
-                self._token = None
-            if self._api_key_token is not None:
-                _current_api_key.reset(self._api_key_token)
-                self._api_key_token = None
+            await self.__aexit__(type(e), e, e.__traceback__)
             raise
 
         return self
@@ -590,9 +671,12 @@ class EvalContext(Environment):
         if exc_type is not None:
             self.error = exc_val
             error_msg = str(exc_val) if exc_val else "Unknown error"
+        elif self.error is not None:
+            error_msg = str(self.error)
 
         # Flush any pending telemetry spans for this trace
-        flush(self.trace_id)
+        if self._trace_enabled:
+            flush(self.trace_id)
 
         # Disconnect environment (parent class) - also runs evaluate tools
         await super().__aexit__(exc_type, exc_val, exc_tb)
@@ -659,8 +743,7 @@ class EvalContext(Environment):
 
     def _print_eval_link(self) -> None:
         """Print a nicely formatted eval link."""
-        # Skip if link printing is suppressed (e.g., parallel child traces)
-        if self._suppress_link:
+        if self._suppress_link or not self._trace_enabled:
             return
 
         from hud.eval.display import print_link
@@ -670,8 +753,7 @@ class EvalContext(Environment):
 
     def _print_single_result(self, error_msg: str | None) -> None:
         """Print a single eval result summary."""
-        # Skip if link printing is suppressed (e.g., parallel child traces)
-        if self._suppress_link:
+        if self._suppress_link or not self._trace_enabled:
             return
 
         from hud.eval.display import print_single_result
@@ -690,4 +772,5 @@ __all__ = [
     "get_current_api_key",
     "get_current_trace_headers",
     "get_current_trace_id",
+    "set_trace_context",
 ]

@@ -22,14 +22,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import mcp.types as types
 from openai import AsyncOpenAI
-from pydantic import ConfigDict, Field
 
 from hud.settings import settings
-from hud.types import AgentResponse, BaseAgentConfig, MCPToolCall, MCPToolResult
+from hud.types import AgentResponse, AgentType, BaseAgentConfig, MCPToolCall, MCPToolResult
 from hud.utils.hud_console import HUDConsole
 from hud.utils.types import with_signature
 
-from .base import BaseCreateParams, MCPAgent
+from .base import MCPAgent
+from .types import OpenAIChatConfig, OpenAIChatCreateParams
 
 if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionToolParam
@@ -38,28 +38,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class OpenAIChatConfig(BaseAgentConfig):
-    """Configuration for `OpenAIChatAgent`."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    model_name: str = "OpenAI Chat"
-    model: str = "gpt-5-mini"
-    openai_client: AsyncOpenAI | None = None
-    api_key: str | None = None
-    base_url: str | None = None
-    completion_kwargs: dict[str, Any] = Field(default_factory=dict)
-
-
-class OpenAIChatCreateParams(BaseCreateParams, OpenAIChatConfig):
-    pass
-
-
 class OpenAIChatAgent(MCPAgent):
     """MCP-enabled agent that speaks the OpenAI *chat.completions* protocol."""
 
     metadata: ClassVar[dict[str, Any] | None] = None
     config_cls: ClassVar[type[BaseAgentConfig]] = OpenAIChatConfig
+
+    @classmethod
+    def agent_type(cls) -> AgentType:
+        """Return the AgentType for OpenAI-compatible agents."""
+        return AgentType.OPENAI_COMPATIBLE
 
     @with_signature(OpenAIChatCreateParams)
     @classmethod
@@ -82,6 +70,7 @@ class OpenAIChatAgent(MCPAgent):
                 "Use HUD_API_KEY for gateway auth and BYOK headers for provider keys."
             )
 
+        self.oai: AsyncOpenAI
         if self.config.openai_client is not None:
             self.oai = self.config.openai_client
         elif self.config.api_key is not None or self.config.base_url is not None:
@@ -99,8 +88,19 @@ class OpenAIChatAgent(MCPAgent):
             )
 
         self.completion_kwargs = dict(self.config.completion_kwargs)
+
+        # If a specific checkpoint is requested, inject it into extra_body
+        # so the HUD gateway routes to the exact checkpoint for inference.
+        if self.config.checkpoint:
+            extra_body = self.completion_kwargs.get("extra_body") or {}
+            extra_body["checkpoint"] = self.config.checkpoint
+            self.completion_kwargs["extra_body"] = extra_body
+
         self.mcp_schemas: list[ChatCompletionToolParam] = []
         self.hud_console = HUDConsole(logger=logger)
+
+        self._continuation_token_ids: list[int] | None = None
+        self._continuation_message_count: int | None = None
 
     @staticmethod
     def _oai_to_mcp(tool_call: Any) -> MCPToolCall:  # type: ignore[valid-type]
@@ -246,6 +246,13 @@ class OpenAIChatAgent(MCPAgent):
 
         protected_keys = {"model", "messages", "tools"}
         extra = {k: v for k, v in (self.completion_kwargs or {}).items() if k not in protected_keys}
+        extra_body = extra.get("extra_body") or {}
+        return_token_ids = extra_body.get("return_token_ids")
+
+        if return_token_ids and self._continuation_token_ids and self._continuation_message_count:
+            extra_body["prompt_token_ids"] = self._continuation_token_ids
+            extra_body["continuation_from"] = self._continuation_message_count
+            extra["extra_body"] = extra_body
 
         try:
             response = await self._invoke_chat_completion(
@@ -286,6 +293,13 @@ class OpenAIChatAgent(MCPAgent):
             assistant_msg["tool_calls"] = serialized_tool_calls
 
         messages.append(assistant_msg)
+
+        if return_token_ids:
+            prompt_token_ids = getattr(choice, "prompt_token_ids", None)
+            token_ids = getattr(choice, "token_ids", None)
+            if prompt_token_ids is not None and token_ids is not None:
+                self._continuation_token_ids = list(prompt_token_ids) + list(token_ids)
+                self._continuation_message_count = len(messages)
 
         tool_calls = []
         if msg.tool_calls:

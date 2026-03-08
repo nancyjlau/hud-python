@@ -1,6 +1,6 @@
 [project]
 name = "hud-python"
-version = "0.5.0"
+version = "0.5.29"
 description = "SDK for the HUD platform."
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
@@ -18,7 +18,7 @@ dependencies = [
     "mcp>1.21.1,<1.23",
     "fastmcp==2.13.3",
     # For all inference agents
-    "openai>=2.8.1",
+    "openai>=2.26.0",
     # CLI dependencies
     "typer>=0.9.0",
     "rich>=13.0.0",
@@ -35,7 +35,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
 ]
 
 [project.urls]
@@ -53,7 +52,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 exclude = [
-    "environments/",
     "docs/",
     "examples/",
     "**/checkpoints/",
@@ -67,10 +65,9 @@ title = "🚀 Welcome to HUD SDK!"
 message = """[bold cyan]Thanks for using the hud SDK![/bold cyan]
 
 [yellow]Quick Start:[/yellow]
-• Install in development mode: [green]pip install -e .[/green]
+• Install dependencies: [green]uv sync[/green]
 • Try the CLI: [green]hud --help[/green]
-• Analyze an MCP server: [green]hud analyze hud-text-2048:latest[/green]
-• Read the docs: [green]docs/[/green]
+• Read the docs: [green]https://docs.hud.ai[/green]
 
 [dim]For more examples, check out the [cyan]examples/[/cyan] directory.[/dim]
 
@@ -113,11 +110,9 @@ agents = [
     "mcp-use==1.5.0",
     "langchain>=1.1.0",  # Required by mcp-use
     # AI providers
-    "anthropic>=0.75",
+    "anthropic>=0.78.0",
     "google-genai",
     "openai-agents",
-    # Dataset loading (HuggingFace)
-    "datasets>=2.14.0",
     # Image processing for screenshots/grounding
     "pillow>=11.1.0",
     # Jupyter kernel support
@@ -126,7 +121,7 @@ agents = [
 
 # AWS Bedrock support for ClaudeAgent
 bedrock = [
-    "anthropic[bedrock]>=0.75",
+    "anthropic[bedrock]>=0.78.0",
 ]
 
 # Development dependencies - includes testing, linting, and automation tools
@@ -139,8 +134,8 @@ dev = [
     "jupyter_core",
     "dotenv>=0.9.9",
     # Testing and linting
-    "ruff >=0.11.8",
-    "pytest >=8.1.1,<9",
+    "ruff >=0.11.8, <0.15.0",
+    "pytest >=8.1.1",
     "pytest-asyncio",
     "pytest-mock",
     "pytest-cov",
@@ -190,13 +185,14 @@ lint.ignore = [
     "W293",   # Ignore blank line contains whitespace
     "PLC0415", # Allow function-local imports.
     "S101", # Allow assert statements.
+    "S603", # subprocess calls with shell=False are fine.
+    "E731", # Allow lambda assignments.
 ]
 
 [tool.ruff.lint.extend-per-file-ignores]
 "**/tests/**/*.py" = ["PYI", "B", "S", "ANN"]
 "*.ipynb" = ["ALL"] # Disables all rules for Jupyter.
 "**/examples/**/*.py" = ["ALL"]
-"**/environments/**/*.py" = ["ALL"]
 
 
 [tool.ruff.format]
@@ -221,7 +217,6 @@ source = ["hud"]
 omit = [
     "*/tests/*",
     "*/examples/*",
-    "hud/misc/*",
 ]
 
 [tool.coverage.report]
@@ -242,15 +237,13 @@ fail_under = 58
 omit = [
     "*/tests/*",
     "*/examples/*",
-    "hud/misc/*",
 ]
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
 asyncio_mode = "auto"
 testpaths = ["hud", "examples"]
-# Ignore the dev folder and other non-test directories
-addopts = "--ignore=dev --ignore=ref --ignore=test_env --ignore=environments"
+addopts = ""
 markers = [
     "integration: marks tests as integration tests (require HUD_API_KEY, network access)",
 ]

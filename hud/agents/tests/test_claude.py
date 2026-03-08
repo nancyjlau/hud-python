@@ -22,7 +22,7 @@ from hud.types import MCPToolCall, MCPToolResult
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from anthropic.types.beta import BetaImageBlockParam, BetaMessageParam, BetaTextBlockParam
+    from anthropic.types.beta import BetaMessageParam
 
 
 class MockEvalContext(EvalContext):
@@ -99,6 +99,30 @@ class MockStreamContextManager:
         return self.response
 
 
+class MockErrorStreamContextManager:
+    """Mock stream context manager that raises a fixed error while streaming."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def __aenter__(self) -> MockErrorStreamContextManager:
+        return self
+
+    async def __aexit__(
+        self, exc_type: type | None, exc_val: Exception | None, exc_tb: Any
+    ) -> bool:
+        return False
+
+    def __aiter__(self) -> MockErrorStreamContextManager:
+        return self
+
+    async def __anext__(self) -> None:
+        raise self.error
+
+    async def get_final_message(self) -> MagicMock:
+        raise AssertionError("get_final_message should not be called when stream iteration fails")
+
+
 class TestClaudeHelperFunctions:
     """Test helper functions for Claude message formatting."""
 
@@ -123,9 +147,7 @@ class TestClaudeHelperFunctions:
     def test_tool_use_content_block(self) -> None:
         """Test tool result content block creation."""
         tool_use_id = "tool_123"
-        content: list[BetaTextBlockParam | BetaImageBlockParam] = [
-            text_to_content_block("Result text")
-        ]
+        content = [text_to_content_block("Result text")]
 
         result = tool_use_content_block(tool_use_id, content)
 
@@ -412,6 +434,120 @@ class TestClaudeAgent:
         assert response.tool_calls[0].name == "my_tool"
         assert response.tool_calls[0].arguments == {"x": "value"}
 
+    @pytest.mark.asyncio
+    async def test_get_response_retries_same_generation_once_on_invalid_streamed_tool_json(
+        self, mock_anthropic: AsyncAnthropic
+    ) -> None:
+        """First invalid streamed tool JSON should retry without adding guidance."""
+        invalid_json_error = ValueError(
+            "Unable to parse tool parameter JSON from model. Please retry your request or "
+            "adjust your "
+            'prompt. Error: expected value at line 1 column 10. JSON: {"labels": bug}'
+        )
+        first_stream = MockErrorStreamContextManager(invalid_json_error)
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(type="text", text="Recovered")]
+        second_stream = MockStreamContextManager(mock_response)
+
+        mock_anthropic.beta.messages.stream = MagicMock(side_effect=[first_stream, second_stream])
+
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            validate_api_key=False,
+        )
+        agent.claude_tools = []
+        agent.tool_mapping = {}
+        agent.has_computer_tool = False
+        agent._initialized = True
+
+        messages: list[BetaMessageParam] = [
+            cast(
+                "BetaMessageParam",
+                {"role": "user", "content": [{"type": "text", "text": "Create a Linear ticket"}]},
+            )
+        ]
+
+        response = await agent.get_response(messages)
+
+        assert response.content == "Recovered"
+        assert mock_anthropic.beta.messages.stream.call_count == 2
+        # Original user message + assistant response (no guidance message needed)
+        assert len(messages) == 2
+        assert messages[1]["role"] == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_get_response_adds_invalid_json_guidance_after_second_failure(
+        self, mock_anthropic: AsyncAnthropic
+    ) -> None:
+        """Second consecutive invalid JSON failure should add INVALID_JSON guidance."""
+        invalid_json_error = ValueError(
+            "Unable to parse tool parameter JSON from model. Please retry your request or "
+            "adjust your "
+            'prompt. Error: expected value at line 1 column 10. JSON: {"labels": bug}'
+        )
+        first_stream = MockErrorStreamContextManager(invalid_json_error)
+        second_stream = MockErrorStreamContextManager(invalid_json_error)
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(type="text", text="Recovered after guidance")]
+        third_stream = MockStreamContextManager(mock_response)
+
+        mock_anthropic.beta.messages.stream = MagicMock(
+            side_effect=[first_stream, second_stream, third_stream]
+        )
+
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            validate_api_key=False,
+        )
+        agent.claude_tools = []
+        agent.tool_mapping = {}
+        agent.has_computer_tool = False
+        agent._initialized = True
+
+        messages: list[BetaMessageParam] = [
+            cast(
+                "BetaMessageParam",
+                {"role": "user", "content": [{"type": "text", "text": "Create a Linear ticket"}]},
+            )
+        ]
+
+        response = await agent.get_response(messages)
+
+        assert response.content == "Recovered after guidance"
+        assert mock_anthropic.beta.messages.stream.call_count == 3
+        # Original user message + INVALID_JSON guidance + assistant response
+        assert len(messages) == 3
+        retry_message = messages[1]
+        assert retry_message["role"] == "user"
+        retry_content = cast("list[dict[str, Any]]", retry_message["content"])
+        assert "INVALID_JSON" in retry_content[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_get_response_does_not_retry_unrelated_value_error(
+        self, mock_anthropic: AsyncAnthropic
+    ) -> None:
+        """Non-tool-json ValueErrors should propagate immediately."""
+        unrelated_error = ValueError("stream exploded for unrelated reason")
+        mock_anthropic.beta.messages.stream = MagicMock(
+            return_value=MockErrorStreamContextManager(unrelated_error)
+        )
+
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            validate_api_key=False,
+        )
+        agent.claude_tools = []
+        agent.tool_mapping = {}
+        agent.has_computer_tool = False
+        agent._initialized = True
+
+        with pytest.raises(ValueError, match="unrelated reason"):
+            await agent.get_response([])
+
+        assert mock_anthropic.beta.messages.stream.call_count == 1
+
 
 class TestClaudeAgentBedrock:
     """Test ClaudeAgent class with Bedrock."""
@@ -454,7 +590,10 @@ class TestClaudeAgentBedrock:
             )
 
             # Enable computer tool to verify betas list includes computer-use in Bedrock mode.
+            # In real usage, this beta is added by _convert_tools_for_claude when it detects
+            # a computer tool. Here we manually set both flags to simulate that.
             agent.has_computer_tool = True
+            agent._required_betas.add("computer-use-2025-01-24")
 
             mock_response = MagicMock()
             text_block = MagicMock()
@@ -485,7 +624,6 @@ class TestClaudeAgentBedrock:
             _, kwargs = bedrock_client.beta.messages.create.call_args  # type: ignore[union-attr]
             assert kwargs["model"] == "test-model-arn"
             assert kwargs["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
-            assert "fine-grained-tool-streaming-2025-05-14" in kwargs["betas"]
             assert "computer-use-2025-01-24" in kwargs["betas"]
 
     @pytest.mark.asyncio
@@ -516,3 +654,220 @@ class TestClaudeAgentBedrock:
                 validate_api_key=False,
             )
             assert agent.anthropic_client == bedrock_client
+
+
+class TestClaudeAgentComputerTool20251124:
+    """Test ClaudeAgent with the new computer_20251124 tool type."""
+
+    @pytest.fixture
+    def mock_anthropic(self) -> Any:
+        from unittest.mock import MagicMock
+
+        return MagicMock(spec=["messages", "beta"])
+
+    def test_build_native_tool_computer_20251124(self, mock_anthropic: Any) -> None:
+        """Test that _build_native_tool handles computer_20251124."""
+        from hud.tools.native_types import NativeToolSpec
+
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            model="claude-opus-4-6-20260101",
+            validate_api_key=False,
+        )
+
+        spec = NativeToolSpec(
+            api_type="computer_20251124",
+            api_name="computer",
+            beta="computer-use-2025-11-24",
+            role="computer",
+            extra={"display_width": 1920, "display_height": 1080},
+        )
+
+        tool = types.Tool(
+            name="computer",
+            description="Computer tool",
+            inputSchema={},
+        )
+
+        result = cast("dict[str, Any]", agent._build_native_tool(tool, spec))
+        assert result["type"] == "computer_20251124"
+        assert result["name"] == "computer"
+        assert result["display_width_px"] == 1920
+        assert result["display_height_px"] == 1080
+        assert result["enable_zoom"] is True
+
+    def test_get_native_api_name_computer_20251124(self, mock_anthropic: Any) -> None:
+        """Test that _get_native_api_name handles computer_20251124."""
+        from hud.tools.native_types import NativeToolSpec
+
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            validate_api_key=False,
+        )
+        spec = NativeToolSpec(api_type="computer_20251124", api_name="computer")
+        assert agent._get_native_api_name(spec) == "computer"
+
+    def test_legacy_fallback_opus_46_uses_new_computer(self, mock_anthropic: Any) -> None:
+        """Test legacy fallback returns computer_20251124 for Opus 4.6 models."""
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            model="claude-opus-4-6-20260101",
+            validate_api_key=False,
+        )
+        agent._available_tools = []
+
+        legacy_tool = types.Tool(
+            name="anthropic_computer",
+            description="Old-style computer tool",
+            inputSchema={"type": "object", "properties": {}},
+        )
+
+        spec = agent._legacy_native_spec_fallback(legacy_tool)
+        assert spec is not None
+        assert spec.api_type == "computer_20251124"
+        assert spec.beta == "computer-use-2025-11-24"
+
+    def test_legacy_fallback_sonnet4_uses_old_computer(self, mock_anthropic: Any) -> None:
+        """Test legacy fallback returns computer_20250124 for non-Opus 4.5/4.6 models."""
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            model="claude-sonnet-4-20250514",
+            validate_api_key=False,
+        )
+        agent._available_tools = []
+
+        legacy_tool = types.Tool(
+            name="anthropic_computer",
+            description="Old-style computer tool",
+            inputSchema={"type": "object", "properties": {}},
+        )
+
+        spec = agent._legacy_native_spec_fallback(legacy_tool)
+        assert spec is not None
+        assert spec.api_type == "computer_20250124"
+        assert spec.beta == "computer-use-2025-01-24"
+
+    def test_no_fine_grained_streaming_beta(self, mock_anthropic: Any) -> None:
+        """Test that fine-grained-tool-streaming beta is no longer included."""
+        agent = ClaudeAgent.create(
+            model_client=mock_anthropic,
+            validate_api_key=False,
+        )
+        assert "fine-grained-tool-streaming-2025-05-14" not in agent._required_betas
+
+
+class TestClaudeAgentBetaHeader:
+    """Test that the Anthropic-Beta header is handled correctly."""
+
+    @pytest.fixture
+    def mock_anthropic(self) -> Any:
+        return MagicMock(spec=["messages", "beta"])
+
+    @pytest.mark.asyncio
+    async def test_empty_betas_sends_omit_not_empty_list(self, mock_anthropic: Any) -> None:
+        """When no tools require a beta, betas should be Omit() not []."""
+        from anthropic import Omit
+
+        with patch("hud.settings.settings.telemetry_enabled", False):
+            agent = ClaudeAgent.create(
+                model_client=mock_anthropic,
+                validate_api_key=False,
+            )
+            agent.claude_tools = []
+            agent.tool_mapping = {}
+            agent.has_computer_tool = False
+            agent._required_betas = set()  # No betas required
+            agent._initialized = True
+
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(type="text", text="Hello")]
+
+            mock_stream = MockStreamContextManager(mock_response)
+            mock_anthropic.beta.messages.stream = MagicMock(return_value=mock_stream)
+
+            messages = [
+                cast(
+                    "BetaMessageParam",
+                    {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+                )
+            ]
+            await agent.get_response(messages)
+
+            _, kwargs = mock_anthropic.beta.messages.stream.call_args
+            assert isinstance(kwargs["betas"], Omit), (
+                f"Expected Omit() when no betas required, got {type(kwargs['betas'])}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_nonempty_betas_sends_list(self, mock_anthropic: Any) -> None:
+        """When tools require betas, betas should be a list of strings."""
+        with patch("hud.settings.settings.telemetry_enabled", False):
+            agent = ClaudeAgent.create(
+                model_client=mock_anthropic,
+                validate_api_key=False,
+            )
+            agent.claude_tools = []
+            agent.tool_mapping = {}
+            agent.has_computer_tool = True
+            agent._required_betas = {"computer-use-2025-01-24"}
+            agent._initialized = True
+
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(type="text", text="Hello")]
+
+            mock_stream = MockStreamContextManager(mock_response)
+            mock_anthropic.beta.messages.stream = MagicMock(return_value=mock_stream)
+
+            messages = [
+                cast(
+                    "BetaMessageParam",
+                    {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+                )
+            ]
+            await agent.get_response(messages)
+
+            _, kwargs = mock_anthropic.beta.messages.stream.call_args
+            assert isinstance(kwargs["betas"], list)
+            assert "computer-use-2025-01-24" in kwargs["betas"]
+
+    @pytest.mark.asyncio
+    async def test_generic_tools_only_no_beta_header(self, mock_anthropic: Any) -> None:
+        """Generic function tools should not produce a beta header."""
+        with patch("hud.settings.settings.telemetry_enabled", False):
+            tools = [
+                types.Tool(
+                    name="my_tool",
+                    description="A test tool",
+                    inputSchema={"type": "object", "properties": {"x": {"type": "string"}}},
+                )
+            ]
+            ctx = MockEvalContext(tools=tools)
+            agent = ClaudeAgent.create(
+                model_client=mock_anthropic,
+                validate_api_key=False,
+            )
+
+            agent.ctx = ctx
+            await agent._initialize_from_ctx(ctx)
+
+            # Generic tools should not add any betas
+            assert len(agent._required_betas) == 0
+
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(type="text", text="Hello")]
+
+            mock_stream = MockStreamContextManager(mock_response)
+            mock_anthropic.beta.messages.stream = MagicMock(return_value=mock_stream)
+
+            from anthropic import Omit
+
+            messages = [
+                cast(
+                    "BetaMessageParam",
+                    {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+                )
+            ]
+            await agent.get_response(messages)
+
+            _, kwargs = mock_anthropic.beta.messages.stream.call_args
+            assert isinstance(kwargs["betas"], Omit)

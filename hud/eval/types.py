@@ -45,6 +45,7 @@ class EvalExitPayload(EvalPayload):
     reward: float | None = None
     success: bool = True
     error_message: str | None = None
+    evaluation_result: dict[str, Any] | None = None
 
 
 class JobEnterPayload(BaseModel):
@@ -53,6 +54,8 @@ class JobEnterPayload(BaseModel):
     name: str | None = None
     variants: dict[str, Any] | None = None  # Full variant config
     group: int | None = None
+    taskset_id: str | None = None  # evalset UUID to associate job with
+    hud_eval_config: dict[str, Any] | None = None  # replayable hud eval config (no secrets)
 
 
 __all__ = [

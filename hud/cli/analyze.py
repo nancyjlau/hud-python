@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path  # noqa: TC003
 from typing import Any
 
+import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.syntax import Syntax
@@ -16,6 +18,70 @@ from hud.utils.hud_console import HUDConsole
 
 console = Console()
 hud_console = HUDConsole()
+
+
+def analyze_command(
+    params: list[str] = typer.Argument(  # type: ignore[arg-type]  # noqa: B008
+        None,
+        help="Docker image followed by optional Docker run arguments (e.g., 'hud-image:latest -e KEY=value')",  # noqa: E501
+    ),
+    config: Path = typer.Option(  # noqa: B008
+        None,
+        "--config",
+        "-c",
+        help="JSON config file with MCP configuration",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+    ),
+    output_format: str = typer.Option(
+        "interactive",
+        "--format",
+        "-f",
+        help="Output format: interactive, json, markdown",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Enable verbose output (shows tool schemas)",
+    ),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Run container for live analysis (slower but more accurate)",
+    ),
+) -> None:
+    """🔍 Analyze MCP environment - discover tools, resources, and capabilities.
+
+    [not dim]By default, uses cached metadata for instant results.
+    Use --live to run the container for real-time analysis.
+
+    Examples:
+        hud analyze hudpython/test_init      # Fast metadata inspection
+        hud analyze my-env --live            # Full container analysis
+        hud analyze --config mcp-config.json # From MCP config[/not dim]
+    """
+    if config:
+        asyncio.run(analyze_environment_from_config(config, output_format, verbose))
+    elif params:
+        image, *docker_args = params
+        if live or docker_args:
+            from .utils.docker import build_run_command
+
+            docker_cmd = build_run_command(image, docker_args)
+            asyncio.run(analyze_environment(docker_cmd, output_format, verbose))
+        else:
+            from .utils.metadata import analyze_from_metadata
+
+            asyncio.run(analyze_from_metadata(image, output_format, verbose))
+    else:
+        console.print("[red]Error: Must specify either a Docker image or --config[/red]")
+        console.print("\nExamples:")
+        console.print("  hud analyze hudpython/test_init       # Fast metadata analysis")
+        console.print("  hud analyze my-env --live             # Live container analysis")
+        console.print("  hud analyze --config mcp-config.json  # From config file")
+        raise typer.Exit(1)
 
 
 def parse_docker_command(docker_cmd: list[str]) -> dict:
@@ -44,18 +110,21 @@ async def analyze_environment(docker_cmd: list[str], output_format: str, verbose
     ) as progress:
         task = progress.add_task("Initializing MCP client...", total=None)
 
-        # Use FastMCP client directly - no mcp_use deprecation warnings
-        from hud.clients.fastmcp import FastMCPHUDClient
+        from fastmcp import Client as FastMCPClient
 
-        client = FastMCPHUDClient(mcp_config=mcp_config, verbose=verbose, auto_trace=False)
+        from hud.cli.utils.mcp import analyze_environment as mcp_analyze
+
+        client = FastMCPClient(transport=mcp_config)
+        # Extract server name for display (first key in mcp_config)
+        server_name = next(iter(mcp_config.keys()), None)
 
         try:
-            await client.initialize()
+            await client.__aenter__()
             progress.update(task, description="[green]✓ Client initialized[/green]")
 
             # Analyze environment
             progress.update(task, description="Analyzing environment...")
-            analysis = await client.analyze_environment()
+            analysis = await mcp_analyze(client, verbose, server_name=server_name)
             progress.update(task, description="[green]✓ Analysis complete[/green]")
 
         except Exception as e:
@@ -73,7 +142,8 @@ async def analyze_environment(docker_cmd: list[str], output_format: str, verbose
 
             return
         finally:
-            await client.shutdown()
+            if client.is_connected():
+                await client.close()
 
     # Display results based on format
     if output_format == "json":
@@ -95,11 +165,11 @@ def display_interactive(analysis: dict) -> None:
     # Check if this is a live analysis (has metadata) or metadata-only analysis
     if "metadata" in analysis:
         # Live analysis format
-        for server in analysis["metadata"]["servers"]:
+        for server in analysis["metadata"].get("servers", []):
             meta_table.add_row("Server", f"[green]{server}[/green]")
         meta_table.add_row(
             "Initialized",
-            "[green]✓[/green]" if analysis["metadata"]["initialized"] else "[red]✗[/red]",
+            "[green]✓[/green]" if analysis["metadata"].get("initialized") else "[red]✗[/red]",
         )
     else:
         # Metadata-only format
@@ -254,8 +324,10 @@ def display_markdown(analysis: dict) -> None:
 
     # Check if this is live analysis or metadata-only
     if "metadata" in analysis:
-        md.append(f"- **Servers**: {', '.join(analysis['metadata']['servers'])}")
-        md.append(f"- **Initialized**: {'✓' if analysis['metadata']['initialized'] else '✗'}")
+        servers = analysis["metadata"].get("servers", [])
+        if servers:
+            md.append(f"- **Servers**: {', '.join(servers)}")
+        md.append(f"- **Initialized**: {'✓' if analysis['metadata'].get('initialized') else '✗'}")
     else:
         # Metadata-only format
         if "image" in analysis:
@@ -379,25 +451,27 @@ async def _analyze_with_config(
     ) as progress:
         task = progress.add_task("Initializing MCP client...", total=None)
 
-        # Use FastMCP client directly - no mcp_use deprecation warnings
-        from hud.clients.fastmcp import FastMCPHUDClient
+        from fastmcp import Client as FastMCPClient
 
-        client = FastMCPHUDClient(mcp_config=mcp_config, verbose=verbose)
+        from hud.cli.utils.mcp import analyze_environment as mcp_analyze
+
+        client = FastMCPClient(transport=mcp_config)
 
         try:
-            await client.initialize()
+            await client.__aenter__()
             progress.update(task, description="[green]✓ Client initialized[/green]")
 
             # Analyze environment
             progress.update(task, description="Analyzing environment...")
-            analysis = await client.analyze_environment()
+            analysis = await mcp_analyze(client, verbose)
             progress.update(task, description="[green]✓ Analysis complete[/green]")
 
         except Exception as e:
             progress.update(task, description=f"[red]✗ Failed: {e}[/red]")
             return
         finally:
-            await client.shutdown()
+            if client.is_connected():
+                await client.close()
 
     # Display results based on format
     if output_format == "json":
