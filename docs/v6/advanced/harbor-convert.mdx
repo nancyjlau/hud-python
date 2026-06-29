@@ -1,6 +1,6 @@
 ---
 title: "Harbor interop"
-description: "Load Harbor tasks into the HUD runtime, or export HUD tasks as Harbor folders."
+description: "Load Harbor tasks into the HUD runtime or export HUD tasks to Harbor folders, with the converter CLI and a field-by-field mapping between formats."
 icon: "ship"
 ---
 
@@ -33,15 +33,22 @@ for task in taskset:
     print(task.env, task.id)
 ```
 
-Like every task row, the result carries no placement. Run it by supplying one —
-today that means a substrate already serving the control channel
-(`runtime=Runtime(url)`); a docker provider that builds and runs each task's
-`environment/` image is the planned follow-up:
+Like every task row, the result carries no placement. Run it by supplying one.
+For local Docker-backed Harbor execution, use `HarborRuntime`; it builds the
+task's `environment/` image, runs a fresh container, exposes the workspace
+through HUD's normal shell capability, and grades by running `tests/test.sh`:
 
 ```python
-from hud import Runtime
+from integrations.harbor import HarborRuntime
 
-job = await taskset.run(agent, runtime=Runtime("tcp://127.0.0.1:8765"))
+job = await taskset.run(agent, runtime=HarborRuntime("./terminal-bench"))
+```
+
+The eval CLI also detects local Harbor task directories and datasets when using
+local runtime placement:
+
+```bash
+hud eval ./terminal-bench claude --task-ids cancel-async-tasks --max-steps 30
 ```
 
 ## Export HUD tasks to Harbor
@@ -84,13 +91,13 @@ set `[verifier.environment]` in `task.toml`.
 
 The mapping is mechanical, so **review the result** — confirm the prompt reads
 naturally, the grader scores what the prompt asks for, and there's no leftover
-answer leakage (see [Designing tasks for signal](/v6/run/signal)).
+answer leakage (see [Designing tasks for signal](/v6/reference/advice)).
 
 ## See also
 
 <CardGroup cols={2}>
-<Card title="Package & deploy" icon="rocket" href="/v6/run/deploy" />
+<Card title="Package & deploy" icon="rocket" href="/v6/reference/runtime" />
 <Card title="Tasks & placement" icon="list-check" href="/v6/reference/tasks" />
-<Card title="Designing tasks for signal" icon="signal" href="/v6/run/signal" />
+<Card title="Designing tasks for signal" icon="signal" href="/v6/reference/advice" />
 <Card title="CLI reference" icon="terminal" href="/v6/reference/cli" />
 </CardGroup>
